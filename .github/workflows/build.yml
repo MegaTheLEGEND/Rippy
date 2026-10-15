@@ -1,0 +1,83 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # VideoLAN only publishes libdvdcss as source, so compile libdvdcss-2.dll with MSYS2/MinGW.
+      # build.bat then finds it in the folder and embeds it in the exe.
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-meson
+            mingw-w64-x86_64-ninja
+      - name: Build libdvdcss-2.dll from source
+        shell: msys2 {0}
+        run: bash get_libdvdcss.sh
+      # build.bat downloads HandBrakeCLI 1.11.2 (checksum-verified) if it isn't in the repo,
+      # installs PyInstaller + smbprotocol, and builds dist\rip.exe with the Rippy icon.
+      - name: Build rip.exe
+        shell: cmd
+        run: call build.bat
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rippy-windows
+          path: dist/rip.exe
+          if-no-files-found: error
+
+  linux:
+    # Older Ubuntu on purpose: a binary built against an older glibc runs on more distros.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install HandBrakeCLI
+        run: sudo apt-get update && sudo apt-get install -y handbrake-cli
+      - name: Check tkinter is available
+        run: python -c "import tkinter; print('tkinter OK')"
+      # build.sh copies HandBrakeCLI from PATH on Linux, then runs PyInstaller.
+      - name: Build rip
+        run: bash build.sh
+      - name: Package (keeps the executable bit)
+        run: tar -czf rippy-linux.tar.gz -C dist rip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rippy-linux
+          path: rippy-linux.tar.gz
+          if-no-files-found: error
+
+  release:
+    # Pushing a tag like v1.0.0 attaches both builds to a GitHub Release.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/rippy-windows/rip.exe
+            artifacts/rippy-linux/rippy-linux.tar.gz

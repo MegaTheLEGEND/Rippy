@@ -19,6 +19,7 @@ HandBrakeCLI
 HandBrakeCLI.exe
 libdvdcss-2.dll
 MakeMKV/
+hb_download*
 
 # --- Your personal HandBrake presets (remove these two lines if you want to share them) ---
 movie_profile.json
