@@ -214,6 +214,12 @@ The things you might change, all near the top of `rip.py`:
     python rip.py --nas-test   checks the NAS login and write access, then exits
     python rip.py --check-update   checks GitHub for a newer release, then exits
 
+## One exe with your settings built in
+Set everything up on one PC, then open **Settings > Portable copy > Save a copy...** (or run
+`rip.exe --export-portable NEW.exe`). You get a single exe with your NAS login, TMDB key and profiles inside it. Copy
+that exe to as many PCs as you like; each one runs with no setup. Settings saved on a PC override the built-in ones there.
+The copy holds the NAS password and TMDB key in readable form, and an updated Rippy needs a new copy saved.
+
 ## Installing and updating
 Each release has two Windows downloads:
 

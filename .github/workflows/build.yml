@@ -56,6 +56,21 @@ jobs:
             -d Version=${{ steps.ver.outputs.version }} \
             -d ExePath=dist/rip.exe -d IconPath=rippy.ico -d FlagPath=installer/installed.flag \
             -o out/Rippy.msi
+      - name: Test built-in settings (copy the exe with settings inside, run it on a "fresh PC")
+        shell: pwsh
+        run: |
+          $real = $env:APPDATA
+          $a = Join-Path $PWD 'appdata-a'; $b = Join-Path $PWD 'appdata-b'
+          New-Item -ItemType Directory -Force "$a\Rippy", $b | Out-Null
+          '{"tmdb_api_key": "ci-test-key"}' | Set-Content "$a\Rippy\settings.json" -Encoding utf8
+          $env:APPDATA = $a
+          $p = Start-Process "$PWD\out\Rippy-portable.exe" -ArgumentList '--export-portable', "$PWD\copy.exe" -Wait -PassThru
+          if ($p.ExitCode -ne 0 -or -not (Test-Path copy.exe)) { throw "export-portable failed" }
+          $env:APPDATA = $b                      # a PC with no settings of its own
+          $p = Start-Process "$PWD\copy.exe" -ArgumentList '--dump-embedded', "$PWD\dump.json" -Wait -PassThru
+          if ($p.ExitCode -ne 0 -or -not (Test-Path dump.json)) { throw "the exe with built-in settings didn't start" }
+          if ((Get-Content dump.json -Raw) -notmatch 'ci-test-key') { throw "built-in settings were not found: $(Get-Content dump.json -Raw)" }
+          $env:APPDATA = $real
       - name: Test the MSI (install, check, uninstall)
         shell: pwsh
         run: |

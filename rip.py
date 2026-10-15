@@ -28,6 +28,7 @@ Usage:
     python rip.py --version   print the version, then exit
     python rip.py --nas-test check the NAS login and write access, then exit
     python rip.py --check-update   check GitHub for a newer release, then exit
+    rip.exe --export-portable NEW.exe   save a copy of the exe with your settings built in
 """
 import codecs, hashlib, json, os, platform, queue, re, shutil, statistics, subprocess, sys, tempfile, threading, time, traceback
 import urllib.error, urllib.parse, urllib.request
@@ -105,12 +106,81 @@ SETTINGS_DIR = _settings_dir()
 SETTINGS_FILE = SETTINGS_DIR / "settings.json"
 
 
-def load_settings():
+# Settings can also be built into the exe itself: Settings > Portable copy writes a copy of the exe with your settings
+# appended at the end (JSON, then its length, then _EMBED_MAGIC). PyInstaller finds its own data by scanning for its
+# marker, so the extra bytes at the end don't bother it. Settings saved on a PC (settings.json above) win, key by key,
+# over the built-in ones, so a copied exe works on a fresh PC and can still be changed there.
+_EMBED_MAGIC = b"RIPPYCFG"
+
+
+def _find_embedded(path):
+    """(length of the exe without any built-in settings, the settings JSON bytes or None)."""
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        if size < 16:
+            return size, None
+        f.seek(size - 16)
+        n, magic = int.from_bytes(f.read(8), "big"), f.read(8)
+        if magic != _EMBED_MAGIC or n > size - 16:
+            return size, None
+        f.seek(size - 16 - n)
+        return size - 16 - n, f.read(n)
+
+
+_embedded_cache = None
+
+
+def embedded_settings():
+    """The settings built into this exe (a dict, empty if none)."""
+    global _embedded_cache
+    if _embedded_cache is None:
+        _embedded_cache = {}
+        if getattr(sys, "frozen", False):
+            try:
+                data = json.loads(_find_embedded(sys.executable)[1] or b"{}")
+                _embedded_cache = data if isinstance(data, dict) else {}
+            except Exception:
+                pass
+    return _embedded_cache
+
+
+def export_portable(dest, settings=None, src=None):
+    """Write a copy of this exe to `dest` with `settings` (default: the current ones) built in."""
+    if src is None:
+        if not getattr(sys, "frozen", False):
+            raise RuntimeError("This only works from the Rippy exe, not from 'python rip.py'.")
+        src = sys.executable
+    src, dest = Path(src), Path(dest)
+    if dest.exists() and dest.resolve() == src.resolve():
+        raise RuntimeError("Pick a different file name: a running exe can't overwrite itself.")
+    blob = json.dumps(load_settings() if settings is None else settings, indent=1).encode("utf-8")
+    keep = _find_embedded(src)[0]                          # drops settings already built into the source exe
+    tmp = dest.with_name(dest.name + ".part")
     try:
-        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
+        with open(src, "rb") as fi, open(tmp, "wb") as fo:
+            left = keep
+            while left > 0:
+                chunk = fi.read(min(1 << 20, left))
+                if not chunk:
+                    raise RuntimeError("The exe ended earlier than expected.")
+                fo.write(chunk)
+                left -= len(chunk)
+            fo.write(blob + len(blob).to_bytes(8, "big") + _EMBED_MAGIC)
+        os.replace(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def load_settings():
+    data = dict(embedded_settings())
+    try:
+        local = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        if isinstance(local, dict):
+            data.update(local)                            # saved on this PC wins over built into the exe
     except Exception:
-        return {}
+        pass
+    return data
 
 
 def save_settings(data):
@@ -2718,6 +2788,7 @@ class SettingsWindow:
         self._build_tmdb(nb)
         self.movie = self._profile_tab(nb, "movie", "Movie profile")
         self.tv = self._profile_tab(nb, "tv", "TV profile")
+        self._build_portable(nb)
         self._build_about(nb)
         def wheel(e):
             for st in (self.movie, self.tv):
@@ -2777,6 +2848,46 @@ class SettingsWindow:
                 "Your nas.json is never changed.")
         ttk.Label(tab, text=note, style="Muted.TLabel", wraplength=int(620 * self.app.k), justify="left"
                   ).pack(anchor="w", pady=(12, 0))
+
+    # ----- Portable copy -----
+    def _build_portable(self, nb):
+        tab = ttk.Frame(nb, padding=(0, 18, 0, 0))
+        nb.add(tab, text="Portable copy")
+        card = RoundFrame(tab)
+        card.pack(fill="x")
+        b = card.body
+        ttk.Label(b, text="Copy Rippy with your settings built in", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(b, text="Saves one exe that carries your NAS login, TMDB key and profiles inside it. Copy that exe to "
+                  "other PCs and run it: no setup, no extra files.", style="CardSub.TLabel",
+                  wraplength=int(600 * self.app.k), justify="left").grid(row=1, column=0, sticky="w", pady=(4, 12))
+        row = ttk.Frame(b, style="Inner.TFrame")
+        row.grid(row=2, column=0, sticky="w")
+        self.export_btn = ttk.Button(row, text="Save a copy\u2026", command=self._export)
+        self.export_btn.pack(side="left")
+        self.export_result = ttk.Label(row, text="", style="CardSub.TLabel", wraplength=int(430 * self.app.k))
+        self.export_result.pack(side="left", padx=14)
+        if not getattr(sys, "frozen", False):
+            self.export_btn.state(["disabled"])
+            self.export_result.configure(text="Only available in the Rippy exe, not 'python rip.py'.")
+        note = ("It copies what is saved, so press Save here first if you just changed something. The copy holds the NAS "
+                "password and TMDB key in readable form, so only hand it to people you'd give those to. On each PC, "
+                "settings saved there override the built-in ones. Updating Rippy (or running a newer exe) loses the "
+                "built-in settings unless you save a new copy.")
+        ttk.Label(tab, text=note, style="Muted.TLabel", wraplength=int(620 * self.app.k), justify="left"
+                  ).pack(anchor="w", pady=(12, 0))
+
+    def _export(self):
+        from tkinter import filedialog
+        dest = filedialog.asksaveasfilename(parent=self.win, title="Save a copy of Rippy", defaultextension=".exe" if OS == "Windows" else "",
+                                            initialfile="Rippy-portable.exe" if OS == "Windows" else "rippy",
+                                            filetypes=[("Program", "*.exe")] if OS == "Windows" else [("All files", "*")])
+        if not dest:
+            return
+        try:
+            export_portable(dest)
+            self.export_result.configure(text=f"Saved {dest}", foreground=GOOD)
+        except Exception as e:
+            self.export_result.configure(text=f"Couldn't save it: {e}", foreground=BAD)
 
     # ----- About -----
     def _build_about(self, nb):
@@ -3063,6 +3174,8 @@ class SettingsWindow:
         if key != self.tmdb_initial:
             if key:
                 s["tmdb_api_key"] = key
+            elif "tmdb_api_key" in embedded_settings():
+                s["tmdb_api_key"] = ""                              # "" = cleared here, so the built-in key doesn't come back
             else:
                 s.pop("tmdb_api_key", None)
         prof = dict(s.get("profiles") or {})
@@ -3088,6 +3201,8 @@ class SettingsWindow:
                 prof[kind] = text + "\n"
         if prof:
             s["profiles"] = prof
+        elif "profiles" in embedded_settings():
+            s["profiles"] = {}                                      # defaults here, even though the exe has its own built in
         else:
             s.pop("profiles", None)
         try:
@@ -3738,6 +3853,19 @@ def main():
     if "--version" in sys.argv:
         _attach_console()
         print(f"{APP_TITLE} {VERSION}")
+        return
+    if "--export-portable" in sys.argv:            # rip.exe --export-portable NEWFILE.exe
+        _attach_console()
+        i = sys.argv.index("--export-portable")
+        try:
+            export_portable(sys.argv[i + 1])
+            print(f"Saved {sys.argv[i + 1]}")
+        except Exception as e:
+            print(f"Couldn't save the copy: {e}")
+        return
+    if "--dump-embedded" in sys.argv:              # writes the built-in settings to a file (used by the build's self-test)
+        i = sys.argv.index("--dump-embedded")
+        Path(sys.argv[i + 1]).write_text(json.dumps(embedded_settings(), sort_keys=True), encoding="utf-8")
         return
     if "--check-update" in sys.argv:
         _attach_console()
