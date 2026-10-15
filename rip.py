@@ -43,7 +43,7 @@ except Exception:                       # no tkinter installed -> console mode o
 
 OS = platform.system()
 APP_TITLE = "Rippy"
-VERSION = "0.1.2"                           # bump this for each release
+VERSION = "0.1.3"                           # bump this for each release
 GITHUB_URL = "https://github.com/MegaTheLEGEND/Rippy"
 NOWIN = {"creationflags": 0x08000000} if OS == "Windows" else {}   # CREATE_NO_WINDOW: no console flashes from child tools
 HERE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -202,8 +202,8 @@ def auto_answer_enabled():
 
 
 def auto_update_enabled():
-    """Settings > General > "Install updates automatically" (installed version only; on by default)."""
-    return bool(load_settings().get("auto_update", True))
+    """Settings > General > "Install updates automatically" (installed version only; off by default)."""
+    return bool(load_settings().get("auto_update", False))
 
 
 def _auto_txt(msg, sep=" ="):
@@ -2923,7 +2923,7 @@ class SettingsWindow:
         self.boot_initial = boot_enabled() if inst else False
         self.boot_var = tk.BooleanVar(master=self.win, value=self.boot_initial)
         self.auto_answer_var = tk.BooleanVar(master=self.win, value=bool(s.get("auto_answer", True)))
-        self.auto_update_var = tk.BooleanVar(master=self.win, value=bool(s.get("auto_update", True)))
+        self.auto_update_var = tk.BooleanVar(master=self.win, value=bool(s.get("auto_update", False)))
         card = RoundFrame(tab)
         card.pack(fill="x")
         b = card.body

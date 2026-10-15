@@ -135,7 +135,7 @@ You can also test from a console: `python rip.py --nas-test`.
     Turning it off removes the entry; **Uninstall Rippy** in the app removes it too.
   - *Start ripping by itself if I don't answer within 30 seconds* (on by default): see below. Turn it off and Rippy
     waits for your answer on every disc, however long that takes, so nothing rips until you choose.
-  - *Install updates automatically* (installed version only, on by default): see **Updates** above.
+  - *Install updates automatically* (installed version only, off by default): see **Updates** above.
   The switches apply right away (the prompt timer applies from the next question).
   Below them, **About Rippy** shows the version and the GitHub link, with **Check for updates** (asks GitHub right
   now and says whether you're up to date) and, in the installed version, **Uninstall Rippy**.
@@ -243,12 +243,12 @@ Each release has two Windows downloads:
 Both check GitHub for a newer release when they start (then every 6 hours; if the PC is offline, every 5 minutes
 until it works) and show a banner at the top of the window.
 
-The **installed** version updates itself (**Settings > General > Install updates automatically**, on by default):
-it downloads the new `Rippy.msi` in the background, checks it against the SHA-256 GitHub lists for it, and installs it
-as soon as Rippy is idle, meaning no rip running, no disc being asked about or scanned, no question on screen and no
+By default the **installed** version only shows the banner, with an **Install update** button that downloads the new
+`Rippy.msi`, checks it against the SHA-256 GitHub lists for it, and installs it when you click it (it asks first if rips
+are running). Turn on **Settings > General > Install updates automatically** (off by default) and it does this by itself:
+it downloads the update in the background and installs it as soon as Rippy is idle, meaning no rip running, no disc being asked about or scanned, no question on screen and no
 NAS upload in progress. Rippy then restarts minimized. While an update waits for Rippy to be idle the banner has an
-**Install now** button (it asks first if rips are running); the **x** cancels the waiting update. With the setting
-off, the banner has an **Install update** button instead, which downloads and installs when you click it.
+**Install now** button (it asks first if rips are running); the **x** cancels the waiting update.
 
 The **portable** version's banner has a **Download** button that opens the release page; it never updates itself.
 `python rip.py --check-update` does the check from a console. Set `UPDATE_CHECK = False` in `rip.py` to turn all of it off.
