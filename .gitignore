@@ -1,0 +1,38 @@
+# --- Secrets: NAS login (host, username, PASSWORD). Commit nas.json.example instead. ---
+nas.json
+settings.json
+
+# --- PyInstaller output ---
+build/
+dist/
+*.spec
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# --- Third-party binaries you drop in this folder (big, and not yours to redistribute) ---
+HandBrakeCLI
+HandBrakeCLI.exe
+libdvdcss-2.dll
+MakeMKV/
+
+# --- Your personal HandBrake presets (remove these two lines if you want to share them) ---
+movie_profile.json
+tv_profile.json
+
+# --- Rips and logs, in case OUTPUT_DIR is ever pointed inside the project ---
+Rips/
+*.partial
+*.partial.mp4
+*.log
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
