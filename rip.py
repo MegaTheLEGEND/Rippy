@@ -24,7 +24,7 @@ Requires:  pip install smbprotocol
 Usage:
     python rip.py            run the ripper (window; minimizes to the taskbar)
     python rip.py --nogui    run it in a plain console instead
-    python rip.py --minimized   start the window minimized (what start-with-Windows uses)
+    python rip.py --minimized   start hidden in the system tray, or minimized if there is no tray (what start-with-Windows uses)
     python rip.py --list     show detected drives/discs and exit (for testing)
     python rip.py --version   print the version, then exit
     python rip.py --nas-test check the NAS login and write access, then exit
@@ -40,6 +40,12 @@ try:
     from tkinter import ttk, messagebox
 except Exception:                       # no tkinter installed -> console mode only
     tk = ttk = messagebox = None
+
+try:                                    # system tray icon (Windows): pip install pystray pillow
+    import pystray
+    from PIL import Image
+except Exception:                       # not installed -> no tray; the X button just closes and --minimized minimizes
+    pystray = Image = None
 
 OS = platform.system()
 APP_TITLE = "Rippy"
@@ -199,6 +205,16 @@ def auto_answer_enabled():
     """Settings > General > "Start automatically if I don't answer". On (default): prompts answer themselves after
     PROMPT_TIMEOUT seconds. Off: Rippy waits for you however long it takes."""
     return bool(load_settings().get("auto_answer", True))
+
+
+def tray_available():
+    """The system tray needs Windows plus the pystray and Pillow packages."""
+    return OS == "Windows" and pystray is not None and Image is not None
+
+
+def close_to_tray_enabled():
+    """Settings > General > "Closing the window sends Rippy to the system tray" (off by default)."""
+    return tray_available() and bool(load_settings().get("close_to_tray", False))
 
 
 def auto_update_enabled():
@@ -2239,6 +2255,20 @@ def launch_uninstaller():
                     [f"msiexec /x {code} /passive /norestart", f'reg delete "HKCU\\{RUN_KEY}" /v {RUN_NAME} /f >nul 2>&1'])
 
 
+def _tray_image():
+    """The picture for the system tray icon: the Rippy logo, or a plain purple dot if rippy.png is missing."""
+    png = _find_icon("rippy.png")
+    if png:
+        try:
+            return Image.open(png).convert("RGBA").resize((64, 64), Image.LANCZOS)
+        except Exception:
+            pass
+    from PIL import ImageDraw
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    ImageDraw.Draw(img).ellipse((4, 4, 60, 60), fill=ACCENT)
+    return img
+
+
 # ===== Window (tkinter) =====
 class UserQuit(Exception):
     """Raised in the watcher thread when the window is closing."""
@@ -2922,6 +2952,8 @@ class SettingsWindow:
         s, inst = self.settings, is_installed()
         self.boot_initial = boot_enabled() if inst else False
         self.boot_var = tk.BooleanVar(master=self.win, value=self.boot_initial)
+        tray_ok = tray_available()
+        self.tray_var = tk.BooleanVar(master=self.win, value=bool(s.get("close_to_tray", False)) and tray_ok)
         self.auto_answer_var = tk.BooleanVar(master=self.win, value=bool(s.get("auto_answer", True)))
         self.auto_update_var = tk.BooleanVar(master=self.win, value=bool(s.get("auto_update", False)))
         card = RoundFrame(tab)
@@ -2936,12 +2968,17 @@ class SettingsWindow:
             ttk.Label(b, text=note, style="CardSub.TLabel", wraplength=wrap, justify="left"
                       ).grid(row=r + 1, column=0, sticky="w", padx=(26, 0), pady=(2, 0))
         row(0, "Start Rippy when I sign in to Windows", self.boot_var,
-            "It starts minimized to the taskbar and watches your drives." + only, inst)
-        row(2, f"Start ripping by itself if I don't answer within {PROMPT_TIMEOUT} seconds", self.auto_answer_var,
+            "It starts hidden in the system tray and watches your drives." + only, inst)
+        no_tray = "" if tray_ok else ("  Windows only." if OS != "Windows"
+                                      else "  Needs the pystray and Pillow packages (pip install pystray pillow).")
+        row(2, "Closing the window (X) sends Rippy to the system tray", self.tray_var,
+            "Rippy keeps watching your drives and ripping. Click its tray icon to open the window again, or right-click "
+            "it and choose Quit to exit." + no_tray, tray_ok)
+        row(4, f"Start ripping by itself if I don't answer within {PROMPT_TIMEOUT} seconds", self.auto_answer_var,
             "On: when a disc goes in and nobody answers the Movie / TV question (or the title questions), Rippy picks "
             f"for you after {PROMPT_TIMEOUT} seconds and starts. Off: Rippy waits for your answer, however long it takes, "
             "so nothing rips until you choose.")
-        row(4, "Install updates automatically", self.auto_update_var,
+        row(6, "Install updates automatically", self.auto_update_var,
             "New releases download in the background and install by themselves when Rippy isn't ripping, uploading "
             "or waiting for an answer. Rippy then restarts minimized." + only, inst)
         b.columnconfigure(0, weight=1)
@@ -3416,6 +3453,7 @@ class SettingsWindow:
         else:
             s.pop("profiles", None)
         s["auto_answer"] = bool(self.auto_answer_var.get())
+        s["close_to_tray"] = bool(self.tray_var.get())
         want_boot = bool(self.boot_var.get())
         if is_installed():
             s["auto_update"] = bool(self.auto_update_var.get())
@@ -3477,17 +3515,20 @@ class RipperGUI:
         self.stop_event, self.done, self.worker = threading.Event(), threading.Event(), None
         self.updateq, self.update_info, self._dismissed, self._force_close = queue.Queue(), None, None, False
         self._pending_msi, self._dl_busy, self._idle_tick = None, False, 0   # automatic updates (see _on_update_event)
+        self.trayq, self.tray, self.tray_hidden = queue.Queue(), None, False   # system tray (see "system tray" below)
+        self._tray_told, self._tray_title = False, None
         self._style()
         self._build()
         root.bind("<Return>", self._on_return)
         root.bind_all("<Key>", self._touch, add="+")          # typing/clicking resets the prompt timer
         root.bind_all("<Button-1>", self._touch, add="+")
-        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.protocol("WM_DELETE_WINDOW", self._on_x)
         if UPDATE_CHECK:
             root.after(4000, self._update_tick)
         sync_boot_entry()
         if "--minimized" in sys.argv:                          # how the start-with-Windows entry launches Rippy
-            root.iconify()
+            if not self._to_tray():                            # hidden in the system tray; plain minimize if there is no tray
+                root.iconify()
         if "--just-installed" in sys.argv:                    # the MSI launches Rippy this way after a first install
             root.after(700, lambda: messagebox.showinfo(
                 APP_TITLE, f"Rippy {VERSION} is installed.\n\nOpen it any time from the Start menu. To remove it, use "
@@ -3887,6 +3928,65 @@ class RipperGUI:
         print(f"[{drive}] manual eject.")
         threading.Thread(target=safe_eject, args=(drive,), daemon=True).start()
 
+    # ----- system tray (Windows; needs pystray + Pillow) -----
+    def _tray_start(self):
+        """Create the tray icon (once). Returns True if it is up."""
+        if self.tray is not None:
+            return True
+        if not tray_available():
+            return False
+        try:
+            menu = pystray.Menu(pystray.MenuItem("Show Rippy", lambda *a: self.trayq.put("show"), default=True),
+                                pystray.MenuItem("Quit Rippy", lambda *a: self.trayq.put("quit")))
+            icon = pystray.Icon("Rippy", _tray_image(), APP_TITLE, menu)
+
+            def run():
+                try:
+                    icon.run()
+                except Exception:
+                    self.trayq.put("failed")               # the window comes back, so it can't get stuck hidden
+            threading.Thread(target=run, daemon=True).start()
+            self.tray = icon
+            return True
+        except Exception:
+            self.tray = None
+            return False
+
+    def _tray_stop(self):
+        icon, self.tray = self.tray, None
+        if icon is not None:
+            try:
+                icon.stop()
+            except Exception:
+                pass
+
+    def _to_tray(self):
+        """Hide the window; Rippy keeps running and the tray icon brings it back. False if there is no tray."""
+        if not self._tray_start():
+            return False
+        self.root.withdraw()
+        self.tray_hidden = True
+        return True
+
+    def _from_tray(self):
+        self.tray_hidden = False
+        self.root.deiconify()
+        self.root.state("normal")
+        self.root.lift()
+        try:
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+
+    def _on_x(self):
+        """The window's X button: sends Rippy to the system tray if Settings > General says so, otherwise quits."""
+        if not self.quitting and not self._force_close and close_to_tray_enabled() and self._to_tray():
+            if not self._tray_told:
+                self._tray_told = True
+                notify(APP_TITLE, "Rippy is still running in the system tray. Click its icon to open it.")
+            return
+        self.on_close()
+
     def on_close(self):
         if self.quitting:
             return
@@ -3918,6 +4018,18 @@ class RipperGUI:
                 self._on_update_event(*self.updateq.get_nowait())
         except queue.Empty:
             pass
+        try:
+            while True:
+                ev = self.trayq.get_nowait()
+                if ev == "failed":
+                    self.tray = None
+                if ev == "quit":
+                    self._from_tray()                   # so the "rips are running" question is on screen
+                    self.on_close()
+                else:
+                    self._from_tray()
+        except queue.Empty:
+            pass
         self._idle_tick += 1
         if self._idle_tick >= 20:
             self._idle_tick = 0
@@ -3936,6 +4048,7 @@ class RipperGUI:
             else:
                 self.countdown.configure(text=f"Choosing automatically in {int(left) + 1}s if you don't answer.")
         if self.quitting and (self.done.is_set() or time.time() - self.closing_since > 25):
+            self._tray_stop()                           # take the icon out of the tray before the window goes
             self.root.destroy()
             return
         self.root.after(100, self._pump)
@@ -3986,6 +4099,14 @@ class RipperGUI:
                 self.root.title(f"{APP_TITLE} \u2014 {len(self.cards)} ripping \u00b7 {avg:.0f}%")   # shows on the taskbar
             else:
                 self.root.title(APP_TITLE)
+        if self.tray is not None:                   # the tray tooltip says what the taskbar title would
+            tip = f"{APP_TITLE} \u2014 waiting for your answer" if (self.cur and self.tray_hidden) else self.root.title()
+            if tip != self._tray_title:
+                self._tray_title = tip
+                try:
+                    self.tray.title = tip
+                except Exception:
+                    pass
         self.root.after(500, self._refresh)
 
     def _refresh_upload(self):

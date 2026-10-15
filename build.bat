@@ -42,7 +42,7 @@ echo   VideoLAN only publishes libdvdcss as source. Either put libdvdcss-2.dll i
 echo   or install MSYS2 (msys2.org) to C:\msys64 and run this again to compile it automatically.
 echo.
 :have_dvdcss
-python -m pip install pyinstaller smbprotocol
+python -m pip install pyinstaller smbprotocol pystray pillow
 set EXTRA=
 if exist rippy.ico set EXTRA=%EXTRA% --icon "rippy.ico" --add-data "rippy.ico;."
 if exist rippy.png set EXTRA=%EXTRA% --add-data "rippy.png;."
@@ -54,7 +54,7 @@ if exist nas.json (set EXTRA=%EXTRA% --add-data "nas.json;.") else echo NOTE: no
 if not exist rippy.ico echo NOTE: no rippy.ico found, so the exe will use the default icon.
 taskkill /f /im rip.exe >nul 2>&1
 if exist dist\rip.exe del /f /q dist\rip.exe
-python -m PyInstaller --onefile --noconsole --add-binary "HandBrakeCLI.exe;." --collect-all smbclient --collect-all smbprotocol --collect-all spnego %EXTRA% rip.py
+python -m PyInstaller --onefile --noconsole --add-binary "HandBrakeCLI.exe;." --collect-all smbclient --collect-all smbprotocol --collect-all spnego --hidden-import pystray._win32 %EXTRA% rip.py
 if errorlevel 1 (
   echo.
   echo BUILD FAILED. See the messages above.
