@@ -29,7 +29,7 @@
       <File Id="InstalledFlag" Source="$(FlagPath)" Name="installed.flag" />
       <!-- per-user components need a HKCU key path; with files in it the component needs a fixed Guid (not "*"), which must never change -->
       <RegistryValue Root="HKCU" Key="Software\Rippy" Name="Installed" Type="integer" Value="1" KeyPath="yes" />
-      <!-- the app reads this to offer Settings > About > Uninstall -->
+      <!-- the app reads this to offer Settings > General > Uninstall -->
       <RegistryValue Root="HKCU" Key="Software\Rippy" Name="ProductCode" Type="string" Value="[ProductCode]" />
       <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
       <RemoveFolder Id="RemoveProgramsFolder" Directory="LocalProgramsDir" On="uninstall" />

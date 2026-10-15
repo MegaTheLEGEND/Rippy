@@ -137,6 +137,8 @@ You can also test from a console: `python rip.py --nas-test`.
     waits for your answer on every disc, however long that takes, so nothing rips until you choose.
   - *Install updates automatically* (installed version only, on by default): see **Updates** above.
   The switches apply right away (the prompt timer applies from the next question).
+  Below them, **About Rippy** shows the version and the GitHub link, with **Check for updates** (asks GitHub right
+  now and says whether you're up to date) and, in the installed version, **Uninstall Rippy**.
 - **NAS upload**: described above.
 - **Movie profile** / **TV profile**: the HandBrake settings used for DVD rips.
   Edit them with a form (Output, Video, Audio, Picture, Subtitles), import an
@@ -235,7 +237,7 @@ The copy holds the NAS password and TMDB key in readable form, and an updated Ri
 Each release has two Windows downloads:
 
 - **`Rippy.msi`** (installer): installs Rippy for your user account into `%LOCALAPPDATA%\Programs\Rippy` (no admin
-  prompt) and adds Start menu shortcuts for Rippy and **Uninstall Rippy**, and starts Rippy when the install finishes (it tells you it's installed). To remove it: the Start menu shortcut, **Settings > About > Uninstall Rippy** in the app, or Windows Settings > Apps. Your settings and rips are kept. Silent installs can pass `NOLAUNCH=1` to skip the launch.
+  prompt) and adds Start menu shortcuts for Rippy and **Uninstall Rippy**, and starts Rippy when the install finishes (it tells you it's installed). To remove it: the Start menu shortcut, **Settings > General > Uninstall Rippy** in the app, or Windows Settings > Apps. Your settings and rips are kept. Silent installs can pass `NOLAUNCH=1` to skip the launch.
 - **`Rippy-portable.exe`**: the same program as a single file. Run it from anywhere, nothing is installed.
 
 Both check GitHub for a newer release when they start (then every 6 hours; if the PC is offline, every 5 minutes

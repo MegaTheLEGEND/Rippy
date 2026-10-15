@@ -43,7 +43,7 @@ except Exception:                       # no tkinter installed -> console mode o
 
 OS = platform.system()
 APP_TITLE = "Rippy"
-VERSION = "0.1.1"                           # bump this for each release
+VERSION = "0.1.2"                           # bump this for each release
 GITHUB_URL = "https://github.com/MegaTheLEGEND/Rippy"
 NOWIN = {"creationflags": 0x08000000} if OS == "Windows" else {}   # CREATE_NO_WINDOW: no console flashes from child tools
 HERE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -2903,7 +2903,6 @@ class SettingsWindow:
         self.movie = self._profile_tab(nb, "movie", "Movie profile")
         self.tv = self._profile_tab(nb, "tv", "TV profile")
         self._build_portable(nb)
-        self._build_about(nb)
         def wheel(e):
             for st in (self.movie, self.tv):
                 st["form"].scroll.wheel(e)
@@ -2946,6 +2945,7 @@ class SettingsWindow:
             "New releases download in the background and install by themselves when Rippy isn't ripping, uploading "
             "or waiting for an answer. Rippy then restarts minimized." + only, inst)
         b.columnconfigure(0, weight=1)
+        self._build_about(tab)
 
     # ----- NAS -----
     def _build_nas(self, nb):
@@ -3034,33 +3034,33 @@ class SettingsWindow:
         except Exception as e:
             self.export_result.configure(text=f"Couldn't save it: {e}", foreground=BAD)
 
-    # ----- About -----
-    def _build_about(self, nb):
+    # ----- About (a card at the bottom of the General tab) -----
+    def _build_about(self, tab):
         import webbrowser
-        tab = ttk.Frame(nb, padding=(0, 18, 0, 0))
-        nb.add(tab, text="About")
         card = RoundFrame(tab)
-        card.pack(fill="x")
+        card.pack(fill="x", pady=(14, 0))
         b = card.body
-        ttk.Label(b, text=APP_TITLE, style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(b, text=f"Version {VERSION}", style="CardSub.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 10))
-        link = tk.Label(b, text=GITHUB_URL, bg=PANEL, fg=ACCENT_HI, cursor="hand2", font=(UI_FONT, 10, "underline"))
-        link.grid(row=2, column=0, sticky="w")
+        ttk.Label(b, text=f"About {APP_TITLE}", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
+        info = ttk.Frame(b, style="Inner.TFrame")
+        info.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(info, text=f"Version {VERSION}", style="CardSub.TLabel").pack(side="left")
+        ttk.Label(info, text="   \u00b7   ", style="CardSub.TLabel").pack(side="left")
+        link = tk.Label(info, text=GITHUB_URL, bg=PANEL, fg=ACCENT_HI, cursor="hand2", font=(UI_FONT, 10, "underline"))
+        link.pack(side="left")
         link.bind("<Button-1>", lambda e: webbrowser.open(GITHUB_URL))
-        ttk.Label(b, text="Click the link to open the project on GitHub (releases, source and issues).",
-                  style="CardSub.TLabel").grid(row=3, column=0, sticky="w", pady=(10, 0))
         chk = ttk.Frame(b, style="Inner.TFrame")
-        chk.grid(row=4, column=0, sticky="ew", pady=(16, 0))
+        chk.grid(row=2, column=0, sticky="ew", pady=(12, 0))
         self.upd_btn = ttk.Button(chk, text="Check for updates", command=self._check_updates)
         self.upd_btn.pack(side="left")
-        self.upd_result = ttk.Label(chk, text="", style="CardSub.TLabel", wraplength=int(430 * self.app.k))
-        self.upd_result.pack(side="left", padx=14)
         if is_installed():
-            ttk.Button(b, text="Uninstall Rippy\u2026", style="Danger.TButton", command=self._uninstall
-                       ).grid(row=5, column=0, sticky="w", pady=(16, 0))
+            ttk.Button(chk, text="Uninstall Rippy\u2026", style="Danger.TButton", command=self._uninstall
+                       ).pack(side="right")
+        self.upd_result = ttk.Label(chk, text="", style="CardSub.TLabel", wraplength=int(360 * self.app.k))
+        self.upd_result.pack(side="left", padx=14)
+        b.columnconfigure(0, weight=1)
 
     def _check_updates(self):
-        """About > Check for updates: ask GitHub now, say the result here, and hand a newer release to the main
+        """General > About Rippy > Check for updates: ask GitHub now, say the result here, and hand a newer release to the main
         window (its banner, and the automatic download when that is on)."""
         self.upd_btn.configure(state="disabled")
         self.upd_result.configure(text="Checking\u2026", foreground=MUTED)
@@ -3491,7 +3491,7 @@ class RipperGUI:
         if "--just-installed" in sys.argv:                    # the MSI launches Rippy this way after a first install
             root.after(700, lambda: messagebox.showinfo(
                 APP_TITLE, f"Rippy {VERSION} is installed.\n\nOpen it any time from the Start menu. To remove it, use "
-                "\u201cUninstall Rippy\u201d in the Start menu, Settings > About in Rippy, or Windows Settings > Apps.\n\n"
+                "\u201cUninstall Rippy\u201d in the Start menu, Settings > General in Rippy, or Windows Settings > Apps.\n\n"
                 "Your settings are kept in %APPDATA%\\Rippy.", parent=root))
 
     # ----- look -----
@@ -3746,7 +3746,7 @@ class RipperGUI:
     def _on_update_event(self, kind, value):
         if kind == "offline":
             self.root.after(5 * 60 * 1000, self._update_tick)       # try again soon rather than in 6 hours
-        elif kind in ("found", "manual"):            # "manual" = the About page's button (the timer is already running)
+        elif kind in ("found", "manual"):            # "manual" = the About Rippy button (the timer is already running)
             if kind == "found":
                 self.root.after(UPDATE_INTERVAL * 1000, self._update_tick)
             else:
