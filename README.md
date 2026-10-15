@@ -59,7 +59,7 @@ That file can hold the NAS password, so on Mac/Linux it is made readable by you 
 ## Movie or TV?
 
 Pick **Movie** or **TV show (beta)** on the question box. If nobody answers within
-30 seconds (`PROMPT_TIMEOUT`), Rippy reads the disc's titles and decides:
+30 seconds (`PROMPT_TIMEOUT`; this auto-answer can be switched off in **Settings > General**), Rippy reads the disc's titles and decides:
 several titles of about the same length (especially with a longer "Play All" that
 adds up to them) means TV; one long title, or two long ones of similar length
 (widescreen + fullscreen, theatrical + extended), means movie. Anything unclear
@@ -129,6 +129,14 @@ You can also test from a console: `python rip.py --nas-test`.
 
 ## Settings window
 
+- **General**: three switches.
+  - *Start Rippy when I sign in to Windows* (installed version only, off by default): adds a per-user
+    entry to Windows startup, so no admin rights are needed. Rippy starts minimized to the taskbar and watches your drives.
+    Turning it off removes the entry; **Uninstall Rippy** in the app removes it too.
+  - *Start ripping by itself if I don't answer within 30 seconds* (on by default): see below. Turn it off and Rippy
+    waits for your answer on every disc, however long that takes, so nothing rips until you choose.
+  - *Install updates automatically* (installed version only, on by default): see **Updates** above.
+  The switches apply right away (the prompt timer applies from the next question).
 - **NAS upload**: described above.
 - **Movie profile** / **TV profile**: the HandBrake settings used for DVD rips.
   Edit them with a form (Output, Video, Audio, Picture, Subtitles), import an
@@ -143,7 +151,9 @@ affect DVDs.
 ## Other behavior worth knowing
 
 - If nobody types for 30 seconds (`PROMPT_TIMEOUT`), every prompt answers itself
-  (see the sections above for what each one does).
+  (see the sections above for what each one does). **Settings > General** can turn this off, and then
+  prompts wait for you. A prompt that is waiting stays on screen even if you take the disc out; answering it
+  just ends in a failed rip and an eject.
 - Drives sometimes pull an ejected disc back in. If the same disc label returns to
   a drive within `REINSERT_WINDOW` seconds of an eject, Rippy asks whether to
   proceed; no answer means eject.
@@ -193,7 +203,7 @@ The things you might change, all near the top of `rip.py`:
 | --- | --- |
 | `OUTPUT_DIR` | Local staging folder (default `~/Rips/Movies`); logs go beside it |
 | Settings > TMDB | TMDB key for movie and TV lookups (blank = no lookup). Env var `TMDB_API_KEY` is the fallback |
-| `PROMPT_TIMEOUT` | Seconds without typing before prompts answer themselves |
+| `PROMPT_TIMEOUT` | Seconds without typing before prompts answer themselves (Settings > General can switch this off) |
 | `BD_MIN_LENGTH` | Blu-ray: shortest title (seconds) to dump |
 | `TV_MIN_EPISODE` | TV: shortest title (seconds) that counts as an episode |
 | `TV_DEFAULT_SEASON` | TV: season to assume when the label doesn't say |
@@ -213,6 +223,7 @@ The things you might change, all near the top of `rip.py`:
     python rip.py --version    prints the version, then exits
     python rip.py --nas-test   checks the NAS login and write access, then exits
     python rip.py --check-update   checks GitHub for a newer release, then exits
+    rip.exe --minimized        starts with the window minimized (what start-with-Windows uses)
 
 ## One exe with your settings built in
 Set everything up on one PC, then open **Settings > Portable copy > Save a copy...** (or run
@@ -227,16 +238,24 @@ Each release has two Windows downloads:
   prompt) and adds Start menu shortcuts for Rippy and **Uninstall Rippy**, and starts Rippy when the install finishes (it tells you it's installed). To remove it: the Start menu shortcut, **Settings > About > Uninstall Rippy** in the app, or Windows Settings > Apps. Your settings and rips are kept. Silent installs can pass `NOLAUNCH=1` to skip the launch.
 - **`Rippy-portable.exe`**: the same program as a single file. Run it from anywhere, nothing is installed.
 
-Both check GitHub for a newer release when they start (then every 6 hours) and show a banner at the top of the
-window. In the **installed** version the banner has an **Install update** button: it downloads the new `Rippy.msi`,
-checks it against the SHA-256 GitHub lists for it, closes Rippy (asking first if rips are running), installs it and
-starts the new version. The **portable** version's banner has a **Download** button that opens the release page.
-`python rip.py --check-update` does the check from a console. Set `UPDATE_CHECK = False` in `rip.py` to turn it off.
+Both check GitHub for a newer release when they start (then every 6 hours; if the PC is offline, every 5 minutes
+until it works) and show a banner at the top of the window.
+
+The **installed** version updates itself (**Settings > General > Install updates automatically**, on by default):
+it downloads the new `Rippy.msi` in the background, checks it against the SHA-256 GitHub lists for it, and installs it
+as soon as Rippy is idle, meaning no rip running, no disc being asked about or scanned, no question on screen and no
+NAS upload in progress. Rippy then restarts minimized. While an update waits for Rippy to be idle the banner has an
+**Install now** button (it asks first if rips are running); the **x** cancels the waiting update. With the setting
+off, the banner has an **Install update** button instead, which downloads and installs when you click it.
+
+The **portable** version's banner has a **Download** button that opens the release page; it never updates itself.
+`python rip.py --check-update` does the check from a console. Set `UPDATE_CHECK = False` in `rip.py` to turn all of it off.
+Versions before 0.0.4 only have the manual **Install update** button, so update those once by hand.
 
 ## Releases
-The version is `VERSION` near the top of `rip.py` (it must look like `0.0.3`; the MSI needs plain numbers). To publish a
+The version is `VERSION` near the top of `rip.py` (it must look like `0.0.4`; the MSI needs plain numbers). To publish a
 release, change it and push to `main`: GitHub Actions builds `Rippy.msi`, `Rippy-portable.exe` and the Linux build, test-installs
-and uninstalls the MSI, and creates release `v0.0.3` with them attached. Pushes that don't change the version just build and don't release.
+and uninstalls the MSI, and creates release `v0.0.4` with them attached. Pushes that don't change the version just build and don't release.
 The MSI's `UpgradeCode` (in `installer/Rippy.wxs`) must never change, or new versions will install beside the old one instead of replacing it.
 Neither Windows file is code-signed, so Windows SmartScreen may warn the first time you run one.
 

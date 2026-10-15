@@ -24,6 +24,7 @@ Requires:  pip install smbprotocol
 Usage:
     python rip.py            run the ripper (window; minimizes to the taskbar)
     python rip.py --nogui    run it in a plain console instead
+    python rip.py --minimized   start the window minimized (what start-with-Windows uses)
     python rip.py --list     show detected drives/discs and exit (for testing)
     python rip.py --version   print the version, then exit
     python rip.py --nas-test check the NAS login and write access, then exit
@@ -42,7 +43,7 @@ except Exception:                       # no tkinter installed -> console mode o
 
 OS = platform.system()
 APP_TITLE = "Rippy"
-VERSION = "0.0.3"                           # bump this for each release
+VERSION = "0.0.4"                           # bump this for each release
 GITHUB_URL = "https://github.com/MegaTheLEGEND/Auto-DVD-Ripper"
 NOWIN = {"creationflags": 0x08000000} if OS == "Windows" else {}   # CREATE_NO_WINDOW: no console flashes from child tools
 HERE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -192,6 +193,31 @@ def save_settings(data):
     except OSError:
         pass
     os.replace(tmp, SETTINGS_FILE)
+
+
+def auto_answer_enabled():
+    """Settings > General > "Start automatically if I don't answer". On (default): prompts answer themselves after
+    PROMPT_TIMEOUT seconds. Off: Rippy waits for you however long it takes."""
+    return bool(load_settings().get("auto_answer", True))
+
+
+def auto_update_enabled():
+    """Settings > General > "Install updates automatically" (installed version only; on by default)."""
+    return bool(load_settings().get("auto_update", True))
+
+
+def _auto_txt(msg, sep=" ="):
+    """The '(no answer in 30s = ...)' hint for a prompt; empty when auto-answering is off."""
+    return f" (no answer in {PROMPT_TIMEOUT}s{sep} {msg})" if auto_answer_enabled() else ""
+
+
+def _auto_clause(msg):
+    """'; no answer in 30s = ...' for the end of a longer hint; empty when auto-answering is off."""
+    return f"; no answer in {PROMPT_TIMEOUT}s = {msg}" if auto_answer_enabled() else ""
+
+
+def _deadline(timeout):
+    return float("inf") if timeout is None else time.time() + timeout
 
 
 def tmdb_key():
@@ -746,7 +772,8 @@ def with_year(title, year):
 
 def ask_manual(default):
     """Type a title (+ optional year). Returns (name, needs_review)."""
-    ans = timed_input(f"Movie title [{default}] (auto-picks default after {PROMPT_TIMEOUT}s): ",
+    hint = f" (auto-picks default after {PROMPT_TIMEOUT}s)" if auto_answer_enabled() else ""
+    ans = timed_input(f"Movie title [{default}]{hint}: ",
                       heading="Movie title", initial=default)
     if ans is None:
         print("No response; using the default title, flagged for review.")
@@ -808,7 +835,7 @@ def choose_name(label, answered_in_time, disc_min=None):
         opts = [(f"{r['title']} ({r['year']})   \u00b7   " + (f"{r['runtime']} min" if r["runtime"] else "? min")
                  + ("   \u00b7   fits disc length" if r["ok"] else ""), str(i)) for i, r in enumerate(results, 1)]
         opts.append(("None of these \u2014 type my own", "0"))
-        ans = timed_input(f"Pick 1-{len(results)} (Enter = 1; no answer in {PROMPT_TIMEOUT}s = best fit, into Needs Review): ",
+        ans = timed_input(f"Pick 1-{len(results)} (Enter = 1{_auto_clause('best fit, into Needs Review')}): ",
                           options=opts, default="1",
                           heading=f"Which movie is \u201c{default}\u201d?" + (f"  (disc: {disc_min} min)" if disc_min else ""))
         if ans is None:
@@ -1051,7 +1078,7 @@ def ask_tv_number(what, default, show, label):
     """Ask for a season or disc number (text box, `default` pre-filled). No answer in time = `default`."""
     while True:
         ans = timed_input(f"{show}: which {what} is this disc? [{default}] "
-                          f"(Enter = {default}; no answer in {PROMPT_TIMEOUT}s = {default}): ",
+                          f"(Enter = {default}{_auto_clause(str(default))}): ",
                           heading=f"\u201c{label}\u201d doesn't say which {what} it is. {show}: {what}?  "
                                   f"(best guess: {default})",
                           initial=str(default))
@@ -1690,6 +1717,7 @@ class TVJob:
 
 
 _gui = None          # the RipperGUI when running with a window
+_starting = set()    # drives where a disc is being asked about / scanned but the rip hasn't started yet
 
 
 def timed_input(prompt, timeout=PROMPT_TIMEOUT, options=None, default=None, heading=None, initial=""):
@@ -1698,19 +1726,21 @@ def timed_input(prompt, timeout=PROMPT_TIMEOUT, options=None, default=None, head
     In the window, `options` [(label, value), ...] become buttons (returns the value),
     otherwise a text box (pre-filled with `initial`). `heading` replaces `prompt` there.
     """
+    if not auto_answer_enabled():
+        timeout = None                            # Settings > General: wait for the answer as long as it takes
     notify(APP_TITLE, f"Needs your answer: {heading or prompt.strip()}")
     if _gui is not None:
         return _gui.ask(prompt, timeout, options, default, heading, initial)
     print(prompt, end="", flush=True)
     if OS == "Windows":
         import msvcrt
-        buf, deadline = "", time.time() + timeout
+        buf, deadline = "", _deadline(timeout)
         while time.time() < deadline:
             if not msvcrt.kbhit():
                 time.sleep(0.05)
                 continue
             ch = msvcrt.getwch()
-            deadline = time.time() + timeout          # any keypress resets the timer
+            deadline = _deadline(timeout)             # any keypress resets the timer
             if ch in ("\r", "\n"):
                 print()
                 return buf
@@ -1852,10 +1882,11 @@ def start_job(hb, drive, info, active):
         scan_thread.start()
     kind, timed_out = "", False
     while kind not in ("m", "t"):
-        ans = timed_input(f"Movie or TV show? [m/t] (no answer in {PROMPT_TIMEOUT}s = judged from the disc's titles): ",
+        ans = timed_input("Movie or TV show? [m/t]" + _auto_txt("judged from the disc's titles") + ": ",
                           options=[("Movie", "m"), ("TV show (beta)", "t")], default="m",
-                          heading=f"Disc in {drive}: \u201c{label}\u201d. Movie or TV show?   "
-                                  f"(no answer in {PROMPT_TIMEOUT}s: I'll judge from the disc's titles)")
+                          heading=f"Disc in {drive}: \u201c{label}\u201d. Movie or TV show?"
+                                  + (f"   (no answer in {PROMPT_TIMEOUT}s: I'll judge from the disc's titles)"
+                                     if auto_answer_enabled() else ""))
         if ans is None:
             kind, timed_out = auto_kind(drive, scan, scan_thread), True
         else:
@@ -2124,11 +2155,68 @@ def _run_after_exit(bat, commands):
                      creationflags=0x08000000 | 0x00000200)   # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
 
 
-def launch_installer(msi):
-    """Run the downloaded MSI once we've exited (per-user, so no admin prompt), then start Rippy again.
-    NOLAUNCH=1 stops the MSI from also launching Rippy, which is what a first install does."""
-    _run_after_exit(Path(msi).with_suffix(".bat"), [f'msiexec /i "{msi}" /passive /norestart NOLAUNCH=1',
-                                                     f'start "" "{sys.executable}"'])
+def launch_installer(msi, args="", quiet=False):
+    """Run the downloaded MSI once we've exited (per-user, so no admin prompt), then start Rippy again
+    (with `args`, e.g. --minimized for an automatic update). `quiet` hides the installer's progress window.
+    NOLAUNCH=1 stops the MSI from also launching Rippy, which is what a first install does.
+    The installer replaces the old version, which can drop the start-with-Windows entry, so it is put back after."""
+    cmds = [f'msiexec /i "{msi}" {"/qn" if quiet else "/passive"} /norestart NOLAUNCH=1']
+    if boot_enabled():
+        cmds.append(_boot_reg_add_command())
+    cmds.append(f'start "" "{sys.executable}" {args}'.rstrip())
+    _run_after_exit(Path(msi).with_suffix(".bat"), cmds)
+
+
+# ----- start with Windows (installed version): a per-user Run entry, so no admin rights are needed -----
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_NAME = "Rippy"
+
+
+def _boot_value():
+    """What the Run entry is set to now (None = no entry or not Windows)."""
+    if OS != "Windows":
+        return None
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            return str(winreg.QueryValueEx(k, RUN_NAME)[0])
+    except Exception:
+        return None
+
+
+def _boot_command():
+    return f'"{sys.executable}" --minimized'
+
+
+def _boot_reg_add_command():
+    return f'reg add "HKCU\\{RUN_KEY}" /v {RUN_NAME} /t REG_SZ /d "\\"{sys.executable}\\" --minimized" /f >nul'
+
+
+def boot_enabled():
+    return _boot_value() is not None
+
+
+def set_boot(enabled):
+    """Turn "start Rippy when I sign in" on or off. Raises OSError if Windows refuses."""
+    import winreg
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+        if enabled:
+            winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ, _boot_command())
+        else:
+            try:
+                winreg.DeleteValue(k, RUN_NAME)
+            except FileNotFoundError:
+                pass
+
+
+def sync_boot_entry():
+    """If start-with-Windows is on, make sure the entry exists and points at this exe (an update or a moved
+    install can leave it missing or stale)."""
+    try:
+        if is_installed() and load_settings().get("start_on_boot") and _boot_value() != _boot_command():
+            set_boot(True)
+    except Exception:
+        pass
 
 
 def installed_product_code():
@@ -2147,7 +2235,8 @@ def launch_uninstaller():
     code = installed_product_code()
     if not (is_installed() and code):
         raise RuntimeError("This copy of Rippy wasn't installed with Rippy.msi. Remove it from Settings > Apps instead.")
-    _run_after_exit(Path(tempfile.gettempdir()) / "RippyUninstall.bat", [f"msiexec /x {code} /passive /norestart"])
+    _run_after_exit(Path(tempfile.gettempdir()) / "RippyUninstall.bat",
+                    [f"msiexec /x {code} /passive /norestart", f'reg delete "HKCU\\{RUN_KEY}" /v {RUN_NAME} /f >nul 2>&1'])
 
 
 # ===== Window (tkinter) =====
@@ -2808,6 +2897,7 @@ class SettingsWindow:
         ttk.Label(bar, text="Saved in Rippy's own settings", style="Muted.TLabel").pack(side="left")
         self.nb = nb = ttk.Notebook(outer)
         nb.pack(fill="both", expand=True)
+        self._build_general(nb)
         self._build_nas(nb)
         self._build_tmdb(nb)
         self.movie = self._profile_tab(nb, "movie", "Movie profile")
@@ -2825,6 +2915,37 @@ class SettingsWindow:
 
     def close(self):
         self.win.destroy()
+
+    # ----- General -----
+    def _build_general(self, nb):
+        tab = ttk.Frame(nb, padding=(0, 18, 0, 0))
+        nb.add(tab, text="General")
+        s, inst = self.settings, is_installed()
+        self.boot_initial = boot_enabled() if inst else False
+        self.boot_var = tk.BooleanVar(master=self.win, value=self.boot_initial)
+        self.auto_answer_var = tk.BooleanVar(master=self.win, value=bool(s.get("auto_answer", True)))
+        self.auto_update_var = tk.BooleanVar(master=self.win, value=bool(s.get("auto_update", True)))
+        card = RoundFrame(tab)
+        card.pack(fill="x")
+        b = card.body
+        wrap = int(620 * self.app.k)
+        only = "" if inst else "  Only in the installed version (Rippy.msi)."
+
+        def row(r, text, var, note, enabled=True):
+            ttk.Checkbutton(b, text=text, variable=var, style="Card.TCheckbutton",
+                            state="normal" if enabled else "disabled").grid(row=r, column=0, sticky="w", pady=(10 if r else 0, 0))
+            ttk.Label(b, text=note, style="CardSub.TLabel", wraplength=wrap, justify="left"
+                      ).grid(row=r + 1, column=0, sticky="w", padx=(26, 0), pady=(2, 0))
+        row(0, "Start Rippy when I sign in to Windows", self.boot_var,
+            "It starts minimized to the taskbar and watches your drives." + only, inst)
+        row(2, f"Start ripping by itself if I don't answer within {PROMPT_TIMEOUT} seconds", self.auto_answer_var,
+            "On: when a disc goes in and nobody answers the Movie / TV question (or the title questions), Rippy picks "
+            f"for you after {PROMPT_TIMEOUT} seconds and starts. Off: Rippy waits for your answer, however long it takes, "
+            "so nothing rips until you choose.")
+        row(4, "Install updates automatically", self.auto_update_var,
+            "New releases download in the background and install by themselves when Rippy isn't ripping, uploading "
+            "or waiting for an answer. Rippy then restarts minimized." + only, inst)
+        b.columnconfigure(0, weight=1)
 
     # ----- NAS -----
     def _build_nas(self, nb):
@@ -3209,7 +3330,7 @@ class SettingsWindow:
         nas_changed = nd != self.nas_initial
         if nas_changed:
             if nd["enabled"] and not (nd["host"] and nd["share"]):
-                self.nb.select(0)
+                self.nb.select(1)
                 messagebox.showerror(APP_TITLE, "Enter at least a host and a share, or untick "
                                      "“Upload finished rips to a NAS”.", parent=self.win)
                 return
@@ -3238,7 +3359,7 @@ class SettingsWindow:
                 try:
                     parse_profile(text)
                 except ValueError as e:
-                    self.nb.select(1 if kind == "movie" else 2)
+                    self.nb.select(3 if kind == "movie" else 4)
                     messagebox.showerror(APP_TITLE, f"{'Movie' if kind == 'movie' else 'TV'} profile: {e}",
                                          parent=self.win)
                     return
@@ -3249,11 +3370,23 @@ class SettingsWindow:
             s["profiles"] = {}                                      # defaults here, even though the exe has its own built in
         else:
             s.pop("profiles", None)
+        s["auto_answer"] = bool(self.auto_answer_var.get())
+        want_boot = bool(self.boot_var.get())
+        if is_installed():
+            s["auto_update"] = bool(self.auto_update_var.get())
+            s["start_on_boot"] = want_boot
         try:
             save_settings(s)
         except OSError as e:
             messagebox.showerror(APP_TITLE, f"Couldn't save the settings: {e}", parent=self.win)
             return
+        if is_installed() and want_boot != self.boot_initial:
+            try:
+                set_boot(want_boot)
+            except Exception as e:
+                messagebox.showerror(APP_TITLE, f"Couldn't change the start-with-Windows setting: {e}", parent=self.win)
+        if not s["auto_answer"]:
+            print("Auto-answer is off: Rippy will wait for your answer on every disc.")
         print("Settings saved. Profile and TMDB changes apply from the next rip.")
         if nas_changed:
             reload_nas()
@@ -3298,6 +3431,7 @@ class RipperGUI:
         self.quitting, self.closing_since, self._chips = False, 0, None
         self.stop_event, self.done, self.worker = threading.Event(), threading.Event(), None
         self.updateq, self.update_info, self._dismissed, self._force_close = queue.Queue(), None, None, False
+        self._pending_msi, self._dl_busy, self._idle_tick = None, False, 0   # automatic updates (see _on_update_event)
         self._style()
         self._build()
         root.bind("<Return>", self._on_return)
@@ -3306,6 +3440,9 @@ class RipperGUI:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         if UPDATE_CHECK:
             root.after(4000, self._update_tick)
+        sync_boot_entry()
+        if "--minimized" in sys.argv:                          # how the start-with-Windows entry launches Rippy
+            root.iconify()
         if "--just-installed" in sys.argv:                    # the MSI launches Rippy this way after a first install
             root.after(700, lambda: messagebox.showinfo(
                 APP_TITLE, f"Rippy {VERSION} is installed.\n\nOpen it any time from the Start menu. To remove it, use "
@@ -3503,7 +3640,7 @@ class RipperGUI:
         self.countdown = ttk.Label(pb, style="PromptSub.TLabel")
         self.countdown.pack(anchor="w")
         self.prompt.pack(fill="x", pady=(14, 0), after=self.drives_frame)
-        self.deadline = time.time() + req["timeout"]
+        self.deadline = None if req["timeout"] is None else time.time() + req["timeout"]
         print(f"? {req['heading']}")
         self._flash()
 
@@ -3529,7 +3666,7 @@ class RipperGUI:
             self._answer(self.entry.get())
 
     def _touch(self, _e=None):
-        if self.cur:
+        if self.cur and self.cur["timeout"] is not None:
             self.deadline = time.time() + self.cur["timeout"]
 
     def _flash(self):
@@ -3555,12 +3692,14 @@ class RipperGUI:
             try:
                 self.updateq.put(("found", check_for_update()))
             except Exception:
-                pass                                # offline / rate-limited: try again next time
+                self.updateq.put(("offline", None))   # offline / rate-limited / network not up yet after boot
         threading.Thread(target=work, daemon=True).start()
-        self.root.after(UPDATE_INTERVAL * 1000, self._update_tick)
 
     def _on_update_event(self, kind, value):
-        if kind == "found":
+        if kind == "offline":
+            self.root.after(5 * 60 * 1000, self._update_tick)       # try again soon rather than in 6 hours
+        elif kind == "found":
+            self.root.after(UPDATE_INTERVAL * 1000, self._update_tick)
             info = value
             if not info or info["version"] == self._dismissed:
                 return
@@ -3573,21 +3712,76 @@ class RipperGUI:
                                       command=self.install_update if can_install else self._open_release)
             if not self.update_bar.winfo_ismapped():
                 self.update_bar.pack(fill="x", pady=(14, 0), before=self.drives_frame)
+            if can_install and auto_update_enabled() and not self._dl_busy and not self._pending_msi:
+                self.update_label.configure(text=f"Rippy {info['version']} is available (you have {VERSION}). "
+                                                 "Downloading it in the background\u2026")
+                self._download(info, auto=True)
         elif kind == "progress":
             self.update_btn.configure(text=f"Downloading\u2026 {value}%")
         elif kind == "ready":
-            try:
-                launch_installer(value)
-            except Exception as e:
-                self.update_btn.configure(text="Install update", state="normal")
-                messagebox.showerror(APP_TITLE, f"Couldn't start the installer:\n{e}")
+            path, auto = value
+            self._dl_busy = False
+            if not auto:
+                self._apply_update(path)
                 return
-            self._force_close = True                # the installer waits for us to exit, then starts the new version
-            self.on_close()
+            self._pending_msi = path                # installs by itself the next time Rippy is idle (see _maybe_apply_update)
+            print(f"Update {self.update_info['version']} downloaded; it installs when Rippy is idle.")
+            self.update_label.configure(text=f"Rippy {self.update_info['version']} is ready. It installs by itself "
+                                             "when Rippy isn't ripping or waiting for an answer.")
+            self.update_btn.configure(text="Install now", state="normal", command=self.install_update)
         elif kind == "error":
+            msg, auto = value
+            self._dl_busy = False
             self.update_btn.configure(text="Install update", state="normal")
-            messagebox.showerror(APP_TITLE, f"The update failed:\n{value}\n\nYou can still download it from the "
+            if auto:
+                print(f"Automatic update failed: {msg}")        # no pop-up for something nobody asked for just now
+                self.update_label.configure(text=f"Rippy {self.update_info['version']} is available "
+                                                 f"(you have {VERSION}). The automatic download failed.")
+                return
+            messagebox.showerror(APP_TITLE, f"The update failed:\n{msg}\n\nYou can still download it from the "
                                  "release page with \"What's new\".")
+
+    def _download(self, info, auto):
+        if self._dl_busy:
+            return
+        self._dl_busy = True
+        self.update_btn.configure(text="Downloading\u2026 0%", state="disabled")
+
+        def work():
+            try:
+                path = download_update(info, lambda p: self.updateq.put(("progress", p)))
+                self.updateq.put(("ready", (path, auto)))
+            except Exception as e:
+                self.updateq.put(("error", (str(e), auto)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_update(self, path, auto=False):
+        """Hand the downloaded MSI to a helper that runs once we've exited, then close. An automatic update is
+        silent and brings Rippy back minimized."""
+        try:
+            launch_installer(path, args="--minimized" if auto else "", quiet=auto)
+        except Exception as e:
+            self.update_btn.configure(text="Install update", state="normal")
+            messagebox.showerror(APP_TITLE, f"Couldn't start the installer:\n{e}")
+            return
+        print("Installing the update; Rippy restarts by itself.")
+        self._force_close = True                    # the installer waits for us to exit, then starts the new version
+        self.on_close()
+
+    def _maybe_apply_update(self):
+        """An automatically downloaded update installs only when nothing would be interrupted: no rips, no disc
+        being asked about or scanned, no question on screen, no NAS upload."""
+        if not self._pending_msi or self.quitting:
+            return
+        if not auto_update_enabled():
+            return
+        busy = (self.active or _starting or self.cur is not None or not self.requests.empty()
+                or upload_state.get("file"))
+        if busy:
+            return
+        path, self._pending_msi = self._pending_msi, None
+        if Path(path).exists():
+            self._apply_update(path, auto=True)
 
     def _open_release(self):
         import webbrowser
@@ -3597,6 +3791,7 @@ class RipperGUI:
     def _dismiss_update(self):
         if self.update_info:
             self._dismissed = self.update_info["version"]
+        self._pending_msi = None                    # closing the banner also cancels an update waiting to install
         self.update_bar.pack_forget()
 
     def install_update(self):
@@ -3607,15 +3802,11 @@ class RipperGUI:
         if n and not messagebox.askyesno(APP_TITLE, f"{n} rip(s) are still running.\n\nInstalling the update closes Rippy "
                                          "and cancels them (unfinished files are deleted). Install now?"):
             return
-        self.update_btn.configure(text="Downloading\u2026 0%", state="disabled")
-
-        def work():
-            try:
-                path = download_update(info, lambda p: self.updateq.put(("progress", p)))
-                self.updateq.put(("ready", path))
-            except Exception as e:
-                self.updateq.put(("error", str(e)))
-        threading.Thread(target=work, daemon=True).start()
+        if self._pending_msi and Path(self._pending_msi).exists():   # already downloaded automatically
+            path, self._pending_msi = self._pending_msi, None
+            self._apply_update(path)
+            return
+        self._download(info, auto=False)
 
     # ----- buttons -----
     def open_settings(self):
@@ -3676,12 +3867,18 @@ class RipperGUI:
                 self._on_update_event(*self.updateq.get_nowait())
         except queue.Empty:
             pass
+        self._idle_tick += 1
+        if self._idle_tick >= 20:
+            self._idle_tick = 0
+            self._maybe_apply_update()
         if self.cur is None:
             try:
                 self._show_prompt(self.requests.get_nowait())
             except queue.Empty:
                 pass
-        if self.cur:
+        if self.cur and self.deadline is None:
+            self.countdown.configure(text="Rippy waits until you answer (auto-answer is off in Settings).")
+        elif self.cur:
             left = self.deadline - time.time()
             if left <= 0:
                 self._answer(None)
@@ -3800,7 +3997,7 @@ def confirm_reinsert(drive, label):
     if not prev or not prev[0] or prev[0] != label or time.time() - prev[1] > REINSERT_WINDOW:
         return True
     ans = timed_input(f"The exact same disc was re-inserted into drive {drive}: proceed or eject? [p/e] "
-                      f"(no answer in {PROMPT_TIMEOUT}s = eject): ",
+                      f"{_auto_txt('eject').strip()}: ",
                       options=[("Proceed", "p"), ("Eject", "e")], default="e",
                       heading=f"The exact same disc (\u201c{label}\u201d) was re-inserted into drive {drive}.  "
                               f"Proceed or eject?")
@@ -3838,14 +4035,18 @@ def watch(hb, active, stop=None):
                 disc_labels[d] = info[1]
                 handled.add(d)
                 handled_at[d] = time.time()
-                if not confirm_reinsert(d, info[1]):
-                    safe_eject(d)
-                    continue
-                job = start_job(hb, d, info, active)
-                if job:
-                    active[d] = job
-                    drive_state[d] = f"Ripping: {job.name}"
-                reap(active)
+                _starting.add(d)
+                try:
+                    if not confirm_reinsert(d, info[1]):
+                        safe_eject(d)
+                        continue
+                    job = start_job(hb, d, info, active)
+                    if job:
+                        active[d] = job
+                        drive_state[d] = f"Ripping: {job.name}"
+                    reap(active)
+                finally:
+                    _starting.discard(d)
             else:
                 drive_state[d] = f"Disc: {info[1]}"
         for d in [d for d in drive_state if d not in drives]:
