@@ -201,6 +201,7 @@ The things you might change, all near the top of `rip.py`:
 | `UPLOAD_STALL_SECONDS` / `UPLOAD_ATTEMPTS` | NAS upload stall limit and tries per file |
 | `REINSERT_WINDOW` | Seconds in which the same disc coming back counts as a re-insert |
 | `SCAN_PREVIEWS` / `SCAN_TIMEOUT` | How hard and how long the disc scan works |
+| `UPDATE_CHECK` / `UPDATE_INTERVAL` | Look for a newer GitHub release (and how often, in seconds) |
 | `NOTIFY` | OS notifications when something needs your attention |
 | `SHOW_LOG_WINDOW` | Console mode on Windows: open a live log window per rip |
 
@@ -211,11 +212,27 @@ The things you might change, all near the top of `rip.py`:
     python rip.py --list       shows detected drives and whether a disc is in them
     python rip.py --version    prints the version, then exits
     python rip.py --nas-test   checks the NAS login and write access, then exits
+    python rip.py --check-update   checks GitHub for a newer release, then exits
+
+## Installing and updating
+Each release has two Windows downloads:
+
+- **`Rippy.msi`** (installer): installs Rippy for your user account into `%LOCALAPPDATA%\Programs\Rippy` (no admin
+  prompt) and adds a Start menu shortcut. Uninstall it from Settings > Apps.
+- **`Rippy-portable.exe`**: the same program as a single file. Run it from anywhere, nothing is installed.
+
+Both check GitHub for a newer release when they start (then every 6 hours) and show a banner at the top of the
+window. In the **installed** version the banner has an **Install update** button: it downloads the new `Rippy.msi`,
+checks it against the SHA-256 GitHub lists for it, closes Rippy (asking first if rips are running), installs it and
+starts the new version. The **portable** version's banner has a **Download** button that opens the release page.
+`python rip.py --check-update` does the check from a console. Set `UPDATE_CHECK = False` in `rip.py` to turn it off.
 
 ## Releases
-The version is `VERSION` near the top of `rip.py`. To publish a release, change it (e.g. `0.0.2`) and push
-to `main`: GitHub Actions builds `rip.exe` and the Linux build and creates release `v0.0.2` with them
-attached. Pushes that don't change the version just build and don't release.
+The version is `VERSION` near the top of `rip.py` (it must look like `0.0.3`; the MSI needs plain numbers). To publish a
+release, change it and push to `main`: GitHub Actions builds `Rippy.msi`, `Rippy-portable.exe` and the Linux build, test-installs
+and uninstalls the MSI, and creates release `v0.0.3` with them attached. Pushes that don't change the version just build and don't release.
+The MSI's `UpgradeCode` (in `installer/Rippy.wxs`) must never change, or new versions will install beside the old one instead of replacing it.
+Neither Windows file is code-signed, so Windows SmartScreen may warn the first time you run one.
 
 ## Build a single executable (after testing)
 

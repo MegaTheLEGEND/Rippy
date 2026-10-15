@@ -27,8 +27,9 @@ Usage:
     python rip.py --list     show detected drives/discs and exit (for testing)
     python rip.py --version   print the version, then exit
     python rip.py --nas-test check the NAS login and write access, then exit
+    python rip.py --check-update   check GitHub for a newer release, then exit
 """
-import codecs, json, os, platform, queue, re, shutil, statistics, subprocess, sys, threading, time, traceback
+import codecs, hashlib, json, os, platform, queue, re, shutil, statistics, subprocess, sys, tempfile, threading, time, traceback
 import urllib.error, urllib.parse, urllib.request
 from pathlib import Path
 
@@ -40,7 +41,7 @@ except Exception:                       # no tkinter installed -> console mode o
 
 OS = platform.system()
 APP_TITLE = "Rippy"
-VERSION = "0.0.1"                           # bump this for each release
+VERSION = "0.0.2"                           # bump this for each release
 GITHUB_URL = "https://github.com/MegaTheLEGEND/Auto-DVD-Ripper"
 NOWIN = {"creationflags": 0x08000000} if OS == "Windows" else {}   # CREATE_NO_WINDOW: no console flashes from child tools
 HERE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -67,6 +68,8 @@ SCAN_PREVIEWS = 5                           # preview images HandBrake decodes p
 SCAN_TIMEOUT = 900                          # seconds to allow for the one-time disc scan
 UPLOAD_STALL_SECONDS = 60                   # NAS upload: no data accepted for this long = stalled; reconnect and retry
 UPLOAD_ATTEMPTS = 3                         # tries per file before giving up until the next rip/restart
+UPDATE_CHECK = True                         # look for a newer release on GitHub (at start, then every UPDATE_INTERVAL seconds)
+UPDATE_INTERVAL = 6 * 3600
 NAS_CONFIG_FILE = HERE / "nas.json"         # NAS login: next to the exe/script, else the copy embedded in the exe
 # ----------------------------------------------------------------
 
@@ -1952,6 +1955,107 @@ def shutdown(active):
     active.clear()
 
 
+# ===== Updates =====
+# The release job in the GitHub workflow publishes Rippy.msi (installer) and Rippy-portable.exe next to each other.
+# Both builds check the latest release and show a banner. The MSI-installed copy (it has installed.flag next to the exe)
+# gets an "Install update" button that downloads Rippy.msi, closes Rippy, runs the installer and starts the new version;
+# the portable exe just gets a "Download" button that opens the release page.
+GITHUB_REPO = GITHUB_URL.rstrip("/").split("github.com/")[-1]
+_UA = {"User-Agent": f"Rippy/{VERSION}", "Accept": "application/vnd.github+json"}
+
+
+def _parse_version(text):
+    m = re.match(r"\s*v?(\d+(?:\.\d+)*)", str(text))
+    return tuple(int(x) for x in m.group(1).split(".")) if m else ()
+
+
+def is_newer(latest, current=None):
+    """True if version `latest` is higher than `current` (default: this build). '0.0.10' > '0.0.9', '1.0' == '1.0.0'."""
+    a, b = _parse_version(latest), _parse_version(current or VERSION)
+    n = max(len(a), len(b))
+    return bool(a) and a + (0,) * (n - len(a)) > b + (0,) * (n - len(b))
+
+
+def is_installed():
+    """True for the MSI install (the installer drops installed.flag next to the exe); False for the portable exe/script."""
+    return OS == "Windows" and getattr(sys, "frozen", False) and (HERE / "installed.flag").exists()
+
+
+def parse_release(data):
+    """Turn GitHub's 'latest release' JSON into {version, page, msi_url, msi_name, sha256}, or None if it isn't newer."""
+    if not isinstance(data, dict) or data.get("draft") or data.get("prerelease"):
+        return None
+    tag = str(data.get("tag_name") or "")
+    if not is_newer(tag):
+        return None
+    info = {"version": tag.lstrip("vV"), "page": data.get("html_url") or GITHUB_URL + "/releases/latest",
+            "msi_url": None, "msi_name": None, "sha256": None}
+    prefix = f"https://github.com/{GITHUB_REPO}/releases/download/"
+    for a in data.get("assets") or []:
+        name, url = str(a.get("name") or ""), str(a.get("browser_download_url") or "")
+        if name.lower().endswith(".msi") and url.startswith(prefix):
+            digest = str(a.get("digest") or "")           # GitHub adds "sha256:<hex>" to release assets
+            info.update(msi_url=url, msi_name=Path(name).name,
+                        sha256=digest.split(":", 1)[1] if digest.lower().startswith("sha256:") else None)
+            break
+    return info
+
+
+def check_for_update():
+    """Ask GitHub for the latest release. Returns info (see parse_release) if it is newer than this build, else None."""
+    req = urllib.request.Request(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest", headers=_UA)
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return parse_release(json.load(r))
+
+
+def download_update(info, progress=None):
+    """Download the MSI to a temp folder, checking its SHA-256 when GitHub lists one. Returns the file's Path."""
+    folder = Path(tempfile.gettempdir()) / "RippyUpdate"
+    shutil.rmtree(folder, ignore_errors=True)
+    folder.mkdir(parents=True, exist_ok=True)
+    dest, h = folder / info["msi_name"], hashlib.sha256()
+    req = urllib.request.Request(info["msi_url"], headers={"User-Agent": _UA["User-Agent"]})
+    with urllib.request.urlopen(req, timeout=30) as r, open(dest, "wb") as f:
+        total, done = int(r.headers.get("Content-Length") or 0), 0
+        while True:
+            chunk = r.read(1 << 16)
+            if not chunk:
+                break
+            f.write(chunk)
+            h.update(chunk)
+            done += len(chunk)
+            if progress and total:
+                progress(min(100, done * 100 // total))
+    if info.get("sha256") and h.hexdigest().lower() != info["sha256"].lower():
+        dest.unlink(missing_ok=True)
+        raise RuntimeError("The download doesn't match the checksum GitHub lists for it, so it was thrown away.")
+    if dest.stat().st_size < 100_000:
+        dest.unlink(missing_ok=True)
+        raise RuntimeError("The downloaded installer is too small to be right.")
+    return dest
+
+
+def launch_installer(msi):
+    """Start a hidden helper that waits for this process to exit, runs the MSI (per-user, so no admin prompt) and
+    starts Rippy again. The caller must then quit the app."""
+    bat = Path(msi).with_suffix(".bat")
+    pid, exe = os.getpid(), sys.executable
+    bat.write_text("\r\n".join([
+        "@echo off",
+        ":wait",
+        f'tasklist /fi "PID eq {pid}" /fo csv /nh 2>nul | find """{pid}""" >nul',
+        "if not errorlevel 1 (ping -n 2 127.0.0.1 >nul & goto wait)",
+        "ping -n 3 127.0.0.1 >nul",                       # let the exe's launcher process finish too
+        f'msiexec /i "{msi}" /passive /norestart',
+        f'start "" "{exe}"',
+        "",
+    ]), encoding="ascii", errors="replace")
+    env = {k: v for k, v in os.environ.items() if k != "_MEIPASS2"}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"           # so the relaunched exe unpacks itself fresh, not from our temp dir
+    subprocess.Popen(["cmd", "/c", str(bat)], env=env, close_fds=True, cwd=str(Path(msi).parent),
+                     creationflags=0x08000000 | 0x00000200)   # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+
+
 # ===== Window (tkinter) =====
 class UserQuit(Exception):
     """Raised in the watcher thread when the window is closing."""
@@ -3034,12 +3138,15 @@ class RipperGUI:
         self.cur, self.deadline, self.entry, self.countdown = None, 0, None, None
         self.quitting, self.closing_since, self._chips = False, 0, None
         self.stop_event, self.done, self.worker = threading.Event(), threading.Event(), None
+        self.updateq, self.update_info, self._dismissed, self._force_close = queue.Queue(), None, None, False
         self._style()
         self._build()
         root.bind("<Return>", self._on_return)
         root.bind_all("<Key>", self._touch, add="+")          # typing/clicking resets the prompt timer
         root.bind_all("<Button-1>", self._touch, add="+")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        if UPDATE_CHECK:
+            root.after(4000, self._update_tick)
 
     # ----- look -----
     def _style(self):
@@ -3156,6 +3263,17 @@ class RipperGUI:
         ttk.Button(head, text="⚙  Settings", command=self.open_settings).pack(side="right", padx=(0, 10))
         self.drives_frame = ttk.Frame(outer)
         self.drives_frame.pack(fill="x", pady=(16, 0))
+        # update banner (packed above the drives only when a newer release exists)
+        self.update_bar = RoundFrame(outer, fill=PROMPT_BG, outline=ACCENT, body_style="PromptInner.TFrame")
+        ub = ttk.Frame(self.update_bar.body, style="PromptInner.TFrame")
+        ub.pack(fill="x")
+        self.update_label = ttk.Label(ub, style="PromptTitle.TLabel")
+        self.update_label.pack(side="left")
+        ttk.Button(ub, text="\u2715", width=3, command=self._dismiss_update).pack(side="right")
+        self.update_btn = ttk.Button(ub, text="Install update", style="Accent.TButton", command=self.install_update)
+        self.update_btn.pack(side="right", padx=(0, 8))
+        self.update_notes = ttk.Button(ub, text="What's new", command=lambda: self._open_release())
+        self.update_notes.pack(side="right", padx=(0, 8))
         self.prompt = RoundFrame(outer, fill=PROMPT_BG, outline=ACCENT, body_style="PromptInner.TFrame")   # shown only when asking something
         ttk.Label(outer, text="RIPS", style="H2.TLabel").pack(anchor="w", pady=(18, 6))
         self.jobs_frame = ttk.Frame(outer)
@@ -3267,6 +3385,74 @@ class RipperGUI:
         except Exception:
             pass
 
+    # ----- updates -----
+    def _update_tick(self):
+        def work():
+            try:
+                self.updateq.put(("found", check_for_update()))
+            except Exception:
+                pass                                # offline / rate-limited: try again next time
+        threading.Thread(target=work, daemon=True).start()
+        self.root.after(UPDATE_INTERVAL * 1000, self._update_tick)
+
+    def _on_update_event(self, kind, value):
+        if kind == "found":
+            info = value
+            if not info or info["version"] == self._dismissed:
+                return
+            if self.update_info is None or self.update_info["version"] != info["version"]:
+                print(f"Update available: Rippy {info['version']} (you have {VERSION}).")
+            self.update_info = info
+            can_install = is_installed() and bool(info["msi_url"])
+            self.update_label.configure(text=f"Rippy {info['version']} is available (you have {VERSION}).")
+            self.update_btn.configure(text="Install update" if can_install else "Download", state="normal",
+                                      command=self.install_update if can_install else self._open_release)
+            if not self.update_bar.winfo_ismapped():
+                self.update_bar.pack(fill="x", pady=(14, 0), before=self.drives_frame)
+        elif kind == "progress":
+            self.update_btn.configure(text=f"Downloading\u2026 {value}%")
+        elif kind == "ready":
+            try:
+                launch_installer(value)
+            except Exception as e:
+                self.update_btn.configure(text="Install update", state="normal")
+                messagebox.showerror(APP_TITLE, f"Couldn't start the installer:\n{e}")
+                return
+            self._force_close = True                # the installer waits for us to exit, then starts the new version
+            self.on_close()
+        elif kind == "error":
+            self.update_btn.configure(text="Install update", state="normal")
+            messagebox.showerror(APP_TITLE, f"The update failed:\n{value}\n\nYou can still download it from the "
+                                 "release page with \"What's new\".")
+
+    def _open_release(self):
+        import webbrowser
+        if self.update_info:
+            webbrowser.open(self.update_info["page"])
+
+    def _dismiss_update(self):
+        if self.update_info:
+            self._dismissed = self.update_info["version"]
+        self.update_bar.pack_forget()
+
+    def install_update(self):
+        info = self.update_info
+        if not info or not info["msi_url"]:
+            return
+        n = len(self.active)
+        if n and not messagebox.askyesno(APP_TITLE, f"{n} rip(s) are still running.\n\nInstalling the update closes Rippy "
+                                         "and cancels them (unfinished files are deleted). Install now?"):
+            return
+        self.update_btn.configure(text="Downloading\u2026 0%", state="disabled")
+
+        def work():
+            try:
+                path = download_update(info, lambda p: self.updateq.put(("progress", p)))
+                self.updateq.put(("ready", path))
+            except Exception as e:
+                self.updateq.put(("error", str(e)))
+        threading.Thread(target=work, daemon=True).start()
+
     # ----- buttons -----
     def open_settings(self):
         w = getattr(self, "_settings", None)
@@ -3299,7 +3485,7 @@ class RipperGUI:
         if self.quitting:
             return
         n = len(self.active)
-        if n and not messagebox.askyesno(APP_TITLE, f"{n} rip(s) are still running.\n\n"
+        if n and not self._force_close and not messagebox.askyesno(APP_TITLE, f"{n} rip(s) are still running.\n\n"
                                          "Quit and cancel them? Unfinished files are deleted."):
             return
         self.quitting, self.closing_since = True, time.time()
@@ -3321,6 +3507,11 @@ class RipperGUI:
         if chunks:
             for line in re.findall(r"[^\n]*\n|[^\n]+", "".join(chunks)):
                 self.log.append(line, _tag_for(line))
+        try:
+            while True:
+                self._on_update_event(*self.updateq.get_nowait())
+        except queue.Empty:
+            pass
         if self.cur is None:
             try:
                 self._show_prompt(self.requests.get_nowait())
@@ -3547,6 +3738,14 @@ def main():
     if "--version" in sys.argv:
         _attach_console()
         print(f"{APP_TITLE} {VERSION}")
+        return
+    if "--check-update" in sys.argv:
+        _attach_console()
+        try:
+            info = check_for_update()
+            print(f"Update available: {info['version']} ({info['page']})" if info else f"Up to date ({VERSION}).")
+        except Exception as e:
+            print(f"Couldn't check for updates: {e}")
         return
     if "--tail" in sys.argv:
         i = sys.argv.index("--tail")

@@ -35,10 +35,49 @@ jobs:
       - name: Build rip.exe
         shell: cmd
         run: call build.bat
+      - name: Read version from rip.py
+        id: ver
+        shell: bash
+        run: |
+          V=$(sed -n 's/^VERSION = "\([^"]*\)".*/\1/p' rip.py | head -n 1)
+          # an MSI version has to be plain numbers, like 1.2.3
+          if ! echo "$V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then echo "VERSION in rip.py must look like 1.2.3, got '$V'"; exit 1; fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+      # The installer is a per-user MSI (no admin prompt, so the in-app "Install update" button can run it silently).
+      # The portable build is just the same exe, renamed.
+      - name: Install WiX
+        run: dotnet tool install --global wix --version 5.0.2
+      - name: Build Rippy.msi and Rippy-portable.exe
+        shell: bash
+        run: |
+          mkdir out
+          cp dist/rip.exe out/Rippy-portable.exe
+          wix build installer/Rippy.wxs -arch x64 \
+            -d Version=${{ steps.ver.outputs.version }} \
+            -d ExePath=dist/rip.exe -d IconPath=rippy.ico -d FlagPath=installer/installed.flag \
+            -o out/Rippy.msi
+      - name: Test the MSI (install, check, uninstall)
+        shell: pwsh
+        run: |
+          $p = Start-Process msiexec -ArgumentList '/i', "$PWD\out\Rippy.msi", '/qn', '/l*v', "$PWD\msi-install.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "msiexec install failed with exit code $($p.ExitCode)" }
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\Rippy'
+          foreach ($f in 'Rippy.exe', 'installed.flag') { if (-not (Test-Path (Join-Path $dir $f))) { throw "missing after install: $f" } }
+          $p = Start-Process msiexec -ArgumentList '/x', "$PWD\out\Rippy.msi", '/qn', '/l*v', "$PWD\msi-uninstall.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "msiexec uninstall failed with exit code $($p.ExitCode)" }
+          if (Test-Path (Join-Path $dir 'Rippy.exe')) { throw "Rippy.exe still there after uninstall" }
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: msi-logs
+          path: msi-*.log
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:
           name: rippy-windows
-          path: dist/rip.exe
+          path: |
+            out/Rippy.msi
+            out/Rippy-portable.exe
           if-no-files-found: error
 
   linux:
@@ -66,7 +105,7 @@ jobs:
 
   release:
     # The version lives in one place: VERSION in rip.py. When a push to main/master changes it to a version
-    # that has no release yet, this job publishes release v<VERSION> with rip.exe and the Linux build attached
+    # that has no release yet, this job publishes release v<VERSION> with Rippy.msi, Rippy-portable.exe and the Linux build attached
     # as plain files. Pushes that don't change the version just build (so you still see if the build breaks).
     if: github.event_name == 'push'
     needs: [windows, linux]
@@ -104,6 +143,7 @@ jobs:
           TAG: v${{ steps.ver.outputs.version }}
         run: |
           mkdir release
-          cp artifacts/rippy-windows/rip.exe release/rip.exe
+          cp artifacts/rippy-windows/Rippy.msi release/Rippy.msi
+          cp artifacts/rippy-windows/Rippy-portable.exe release/Rippy-portable.exe
           cp artifacts/rippy-linux/rippy-linux.tar.gz release/rippy-linux.tar.gz
           gh release create "$TAG" release/* --target "$GITHUB_SHA" --title "Rippy ${TAG#v}" --generate-notes
