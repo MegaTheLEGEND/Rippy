@@ -74,10 +74,11 @@ jobs:
       - name: Test the MSI (install, check, uninstall)
         shell: pwsh
         run: |
-          $p = Start-Process msiexec -ArgumentList '/i', "$PWD\out\Rippy.msi", '/qn', '/l*v', "$PWD\msi-install.log" -Wait -PassThru
+          $p = Start-Process msiexec -ArgumentList '/i', "$PWD\out\Rippy.msi", '/qn', 'NOLAUNCH=1', '/l*v', "$PWD\msi-install.log" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "msiexec install failed with exit code $($p.ExitCode)" }
           $dir = Join-Path $env:LOCALAPPDATA 'Programs\Rippy'
           foreach ($f in 'Rippy.exe', 'installed.flag') { if (-not (Test-Path (Join-Path $dir $f))) { throw "missing after install: $f" } }
+          if (-not (Get-ItemProperty 'HKCU:\Software\Rippy').ProductCode) { throw "ProductCode not written to the registry" }
           $p = Start-Process msiexec -ArgumentList '/x', "$PWD\out\Rippy.msi", '/qn', '/l*v', "$PWD\msi-uninstall.log" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "msiexec uninstall failed with exit code $($p.ExitCode)" }
           if (Test-Path (Join-Path $dir 'Rippy.exe')) { throw "Rippy.exe still there after uninstall" }

@@ -224,7 +224,7 @@ The copy holds the NAS password and TMDB key in readable form, and an updated Ri
 Each release has two Windows downloads:
 
 - **`Rippy.msi`** (installer): installs Rippy for your user account into `%LOCALAPPDATA%\Programs\Rippy` (no admin
-  prompt) and adds a Start menu shortcut. Uninstall it from Settings > Apps.
+  prompt) and adds Start menu shortcuts for Rippy and **Uninstall Rippy**, and starts Rippy when the install finishes (it tells you it's installed). To remove it: the Start menu shortcut, **Settings > About > Uninstall Rippy** in the app, or Windows Settings > Apps. Your settings and rips are kept. Silent installs can pass `NOLAUNCH=1` to skip the launch.
 - **`Rippy-portable.exe`**: the same program as a single file. Run it from anywhere, nothing is installed.
 
 Both check GitHub for a newer release when they start (then every 6 hours) and show a banner at the top of the

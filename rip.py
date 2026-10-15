@@ -42,7 +42,7 @@ except Exception:                       # no tkinter installed -> console mode o
 
 OS = platform.system()
 APP_TITLE = "Rippy"
-VERSION = "0.0.2"                           # bump this for each release
+VERSION = "0.0.3"                           # bump this for each release
 GITHUB_URL = "https://github.com/MegaTheLEGEND/Auto-DVD-Ripper"
 NOWIN = {"creationflags": 0x08000000} if OS == "Windows" else {}   # CREATE_NO_WINDOW: no console flashes from child tools
 HERE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -2105,25 +2105,49 @@ def download_update(info, progress=None):
     return dest
 
 
-def launch_installer(msi):
-    """Start a hidden helper that waits for this process to exit, runs the MSI (per-user, so no admin prompt) and
-    starts Rippy again. The caller must then quit the app."""
-    bat = Path(msi).with_suffix(".bat")
-    pid, exe = os.getpid(), sys.executable
-    bat.write_text("\r\n".join([
+def _run_after_exit(bat, commands):
+    """Write `commands` to a hidden helper script that waits for this process to exit, then runs them. The caller
+    must then quit the app. (Waiting matters: an installer can't replace or remove an exe that is still running.)"""
+    pid = os.getpid()
+    Path(bat).write_text("\r\n".join([
         "@echo off",
         ":wait",
         f'tasklist /fi "PID eq {pid}" /fo csv /nh 2>nul | find """{pid}""" >nul',
         "if not errorlevel 1 (ping -n 2 127.0.0.1 >nul & goto wait)",
         "ping -n 3 127.0.0.1 >nul",                       # let the exe's launcher process finish too
-        f'msiexec /i "{msi}" /passive /norestart',
-        f'start "" "{exe}"',
+        *commands,
         "",
     ]), encoding="ascii", errors="replace")
     env = {k: v for k, v in os.environ.items() if k != "_MEIPASS2"}
-    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"           # so the relaunched exe unpacks itself fresh, not from our temp dir
-    subprocess.Popen(["cmd", "/c", str(bat)], env=env, close_fds=True, cwd=str(Path(msi).parent),
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"           # so a relaunched exe unpacks itself fresh, not from our temp dir
+    subprocess.Popen(["cmd", "/c", str(bat)], env=env, close_fds=True, cwd=str(Path(bat).parent),
                      creationflags=0x08000000 | 0x00000200)   # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+
+
+def launch_installer(msi):
+    """Run the downloaded MSI once we've exited (per-user, so no admin prompt), then start Rippy again.
+    NOLAUNCH=1 stops the MSI from also launching Rippy, which is what a first install does."""
+    _run_after_exit(Path(msi).with_suffix(".bat"), [f'msiexec /i "{msi}" /passive /norestart NOLAUNCH=1',
+                                                     f'start "" "{sys.executable}"'])
+
+
+def installed_product_code():
+    """The MSI's ProductCode, which the installer stores under HKCU\\Software\\Rippy (None if not found)."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Rippy") as k:
+            code = str(winreg.QueryValueEx(k, "ProductCode")[0])
+        return code if re.fullmatch(r"\{[0-9A-Fa-f-]{36}\}", code) else None
+    except Exception:
+        return None
+
+
+def launch_uninstaller():
+    """Uninstall the MSI-installed Rippy once we've exited. Raises if it isn't an MSI install."""
+    code = installed_product_code()
+    if not (is_installed() and code):
+        raise RuntimeError("This copy of Rippy wasn't installed with Rippy.msi. Remove it from Settings > Apps instead.")
+    _run_after_exit(Path(tempfile.gettempdir()) / "RippyUninstall.bat", [f"msiexec /x {code} /passive /norestart"])
 
 
 # ===== Window (tkinter) =====
@@ -2904,6 +2928,26 @@ class SettingsWindow:
         link.bind("<Button-1>", lambda e: webbrowser.open(GITHUB_URL))
         ttk.Label(b, text="Click the link to open the project on GitHub (releases, source and issues).",
                   style="CardSub.TLabel").grid(row=3, column=0, sticky="w", pady=(10, 0))
+        if is_installed():
+            ttk.Button(b, text="Uninstall Rippy\u2026", style="Danger.TButton", command=self._uninstall
+                       ).grid(row=4, column=0, sticky="w", pady=(16, 0))
+
+    def _uninstall(self):
+        n = len(self.app.active)
+        msg = ("Uninstall Rippy?\n\nRippy closes and is removed. Your settings (NAS login, TMDB key, profiles) and your "
+               "rips are not deleted.")
+        if n:
+            msg += f"\n\n{n} rip(s) are still running; they will be cancelled and unfinished files deleted."
+        if not messagebox.askyesno(APP_TITLE, msg, parent=self.win):
+            return
+        try:
+            launch_uninstaller()
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, str(e), parent=self.win)
+            return
+        self.win.destroy()
+        self.app._force_close = True
+        self.app.on_close()
 
     # ----- TMDB -----
     def _build_tmdb(self, nb):
@@ -3262,6 +3306,11 @@ class RipperGUI:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         if UPDATE_CHECK:
             root.after(4000, self._update_tick)
+        if "--just-installed" in sys.argv:                    # the MSI launches Rippy this way after a first install
+            root.after(700, lambda: messagebox.showinfo(
+                APP_TITLE, f"Rippy {VERSION} is installed.\n\nOpen it any time from the Start menu. To remove it, use "
+                "\u201cUninstall Rippy\u201d in the Start menu, Settings > About in Rippy, or Windows Settings > Apps.\n\n"
+                "Your settings are kept in %APPDATA%\\Rippy.", parent=root))
 
     # ----- look -----
     def _style(self):
