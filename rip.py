@@ -43,7 +43,7 @@ except Exception:                       # no tkinter installed -> console mode o
 
 OS = platform.system()
 APP_TITLE = "Rippy"
-VERSION = "0.0.4"                           # bump this for each release
+VERSION = "0.1.0"                           # bump this for each release
 GITHUB_URL = "https://github.com/MegaTheLEGEND/Auto-DVD-Ripper"
 NOWIN = {"creationflags": 0x08000000} if OS == "Windows" else {}   # CREATE_NO_WINDOW: no console flashes from child tools
 HERE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
