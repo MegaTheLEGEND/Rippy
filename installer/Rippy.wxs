@@ -23,11 +23,11 @@
       </Directory>
     </StandardDirectory>
 
-    <Component Id="RippyApp" Directory="INSTALLFOLDER">
+    <Component Id="RippyApp" Directory="INSTALLFOLDER" Guid="FEE779F3-C1B6-4934-98E5-63DA3DEB8083">
       <File Id="RippyExe" Source="$(ExePath)" Name="Rippy.exe" />
       <!-- installed.flag next to the exe tells the app it was installed from this MSI (see is_installed() in rip.py) -->
       <File Id="InstalledFlag" Source="$(FlagPath)" Name="installed.flag" />
-      <!-- per-user components need a HKCU key path -->
+      <!-- per-user components need a HKCU key path; with files in it the component needs a fixed Guid (not "*"), which must never change -->
       <RegistryValue Root="HKCU" Key="Software\Rippy" Name="Installed" Type="integer" Value="1" KeyPath="yes" />
       <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
       <RemoveFolder Id="RemoveProgramsFolder" Directory="LocalProgramsDir" On="uninstall" />
