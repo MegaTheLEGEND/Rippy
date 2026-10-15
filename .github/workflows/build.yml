@@ -3,7 +3,6 @@ name: Build
 on:
   push:
     branches: [main, master]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -66,18 +65,45 @@ jobs:
           if-no-files-found: error
 
   release:
-    # Pushing a tag like v1.0.0 attaches both builds to a GitHub Release.
-    if: startsWith(github.ref, 'refs/tags/v')
+    # The version lives in one place: VERSION in rip.py. When a push to main/master changes it to a version
+    # that has no release yet, this job publishes release v<VERSION> with rip.exe and the Linux build attached
+    # as plain files. Pushes that don't change the version just build (so you still see if the build breaks).
+    if: github.event_name == 'push'
     needs: [windows, linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+      - name: Read version from rip.py
+        id: ver
+        run: |
+          V=$(sed -n 's/^VERSION = "\([^"]*\)".*/\1/p' rip.py | head -n 1)
+          if [ -z "$V" ]; then echo "Could not find VERSION in rip.py"; exit 1; fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Version in rip.py: $V"
+      - name: Check whether this version is already released
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ steps.ver.outputs.version }}" >/dev/null 2>&1; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+            echo "v${{ steps.ver.outputs.version }} is already released, nothing to publish."
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.exists.outputs.released == 'false'
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            artifacts/rippy-windows/rip.exe
-            artifacts/rippy-linux/rippy-linux.tar.gz
+      - name: Publish release
+        if: steps.exists.outputs.released == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ steps.ver.outputs.version }}
+        run: |
+          mkdir release
+          cp artifacts/rippy-windows/rip.exe release/rip.exe
+          cp artifacts/rippy-linux/rippy-linux.tar.gz release/rippy-linux.tar.gz
+          gh release create "$TAG" release/* --target "$GITHUB_SHA" --title "Rippy ${TAG#v}" --generate-notes

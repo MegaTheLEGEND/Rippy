@@ -67,7 +67,7 @@ is treated as a movie.
 
 ## Movie naming (TMDB)
 
-Set `TMDB_API_KEY` at the top of `rip.py` (free key: themoviedb.org > Settings > API).
+Paste your TMDB key in **Settings > TMDB** (free key: themoviedb.org > Settings > API). It is stored in Rippy's own settings file, never in the exe or script. The `TMDB_API_KEY` environment variable also works as a fallback.
 The disc label is cleaned and searched on TMDB, and you get numbered candidates
 with the year and runtime. Candidates whose runtime fits the disc's main feature
 sort first. Enter takes #1, 0 lets you type your own.
@@ -192,7 +192,7 @@ The things you might change, all near the top of `rip.py`:
 | Setting | What it does |
 | --- | --- |
 | `OUTPUT_DIR` | Local staging folder (default `~/Rips/Movies`); logs go beside it |
-| `TMDB_API_KEY` | TMDB key for movie and TV lookups (blank = no lookup) |
+| Settings > TMDB | TMDB key for movie and TV lookups (blank = no lookup). Env var `TMDB_API_KEY` is the fallback |
 | `PROMPT_TIMEOUT` | Seconds without typing before prompts answer themselves |
 | `BD_MIN_LENGTH` | Blu-ray: shortest title (seconds) to dump |
 | `TV_MIN_EPISODE` | TV: shortest title (seconds) that counts as an episode |
@@ -209,7 +209,13 @@ The things you might change, all near the top of `rip.py`:
     python rip.py              runs the ripper window; insert a disc
     python rip.py --nogui      runs it in the console instead
     python rip.py --list       shows detected drives and whether a disc is in them
+    python rip.py --version    prints the version, then exits
     python rip.py --nas-test   checks the NAS login and write access, then exits
+
+## Releases
+The version is `VERSION` near the top of `rip.py`. To publish a release, change it (e.g. `0.0.2`) and push
+to `main`: GitHub Actions builds `rip.exe` and the Linux build and creates release `v0.0.2` with them
+attached. Pushes that don't change the version just build and don't release.
 
 ## Build a single executable (after testing)
 

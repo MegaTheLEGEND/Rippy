@@ -25,10 +25,11 @@ Usage:
     python rip.py            run the ripper (window; minimizes to the taskbar)
     python rip.py --nogui    run it in a plain console instead
     python rip.py --list     show detected drives/discs and exit (for testing)
+    python rip.py --version   print the version, then exit
     python rip.py --nas-test check the NAS login and write access, then exit
 """
 import codecs, json, os, platform, queue, re, shutil, statistics, subprocess, sys, threading, time, traceback
-import urllib.parse, urllib.request
+import urllib.error, urllib.parse, urllib.request
 from pathlib import Path
 
 try:
@@ -39,6 +40,8 @@ except Exception:                       # no tkinter installed -> console mode o
 
 OS = platform.system()
 APP_TITLE = "Rippy"
+VERSION = "0.0.1"                           # bump this for each release
+GITHUB_URL = "https://github.com/MegaTheLEGEND/Auto-DVD-Ripper"
 NOWIN = {"creationflags": 0x08000000} if OS == "Windows" else {}   # CREATE_NO_WINDOW: no console flashes from child tools
 HERE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 BUNDLE = Path(getattr(sys, "_MEIPASS", HERE))  # where PyInstaller unpacks embedded files
@@ -52,7 +55,6 @@ STATUS_SECONDS = 30                         # how often to print rip progress
 SHOW_LOG_WINDOW = True                      # Windows: open a live log window per rip
 PROMPT_TIMEOUT = 30                         # seconds of no typing before prompts auto-answer
 BD_MIN_LENGTH = 2400                        # Blu-ray: only dump titles at least this many seconds long
-TMDB_API_KEY = "52be8347dcbbcd765b223995d9c97cad"                           # free key from themoviedb.org (Settings > API); blank = no lookup
 REVIEW_DIR_NAME = "_Needs Review"          # unsure matches are ripped here, without a year
 TV_MIN_EPISODE = 900                        # TV (beta): shortest title (seconds) that can be an episode; shorter ones are extras
 TV_DEFAULT_SEASON = 1                       # TV (beta): season to assume when the disc label doesn't say (None = name files by disc label instead)
@@ -117,6 +119,15 @@ def save_settings(data):
     except OSError:
         pass
     os.replace(tmp, SETTINGS_FILE)
+
+
+def tmdb_key():
+    """TMDB API key: saved in Settings (TMDB tab), else the TMDB_API_KEY environment variable, else blank
+    (= no lookup). Free key: themoviedb.org > Settings > API."""
+    k = load_settings().get("tmdb_api_key")
+    if isinstance(k, str) and k.strip():
+        return k.strip()
+    return (os.environ.get("TMDB_API_KEY") or "").strip()
 
 
 def preset_file_for(kind="movie"):
@@ -557,7 +568,7 @@ def _norm(t):
 
 
 def _tmdb_get(path, **params):
-    params["api_key"] = TMDB_API_KEY
+    params["api_key"] = tmdb_key()
     url = f"https://api.themoviedb.org/3/{path}?" + urllib.parse.urlencode(params)
     with urllib.request.urlopen(url, timeout=8) as r:
         return json.load(r)
@@ -566,7 +577,7 @@ def _tmdb_get(path, **params):
 def tmdb_search(query):
     """Return [{id,title,year,runtime}, ...] from TMDB (runtime in minutes or None),
     or None if there's no key / we're offline."""
-    if not TMDB_API_KEY:
+    if not tmdb_key():
         return None
     try:
         data = _tmdb_get("search/movie", query=query)
@@ -768,7 +779,7 @@ def _similar(a, b):
 
 def tmdb_find_show(query):
     """Best TMDB TV match for the cleaned label as {id, name}, or None (no key / offline / no match)."""
-    if not TMDB_API_KEY or not query:
+    if not tmdb_key() or not query:
         return None
     try:
         results = _tmdb_get("search/tv", query=query).get("results") or []
@@ -2574,7 +2585,7 @@ class ProfileForm:
 
 
 class SettingsWindow:
-    """NAS login and HandBrake profiles. Saved to Rippy's own settings.json; the nas.json and profile
+    """NAS login, TMDB key and HandBrake profiles. Saved to Rippy's own settings.json; the nas.json and profile
     files next to the app are only read (as the starting values), never written."""
 
     def __init__(self, app):
@@ -2600,8 +2611,10 @@ class SettingsWindow:
         self.nb = nb = ttk.Notebook(outer)
         nb.pack(fill="both", expand=True)
         self._build_nas(nb)
+        self._build_tmdb(nb)
         self.movie = self._profile_tab(nb, "movie", "Movie profile")
         self.tv = self._profile_tab(nb, "tv", "TV profile")
+        self._build_about(nb)
         def wheel(e):
             for st in (self.movie, self.tv):
                 st["form"].scroll.wheel(e)
@@ -2660,6 +2673,80 @@ class SettingsWindow:
                 "Your nas.json is never changed.")
         ttk.Label(tab, text=note, style="Muted.TLabel", wraplength=int(620 * self.app.k), justify="left"
                   ).pack(anchor="w", pady=(12, 0))
+
+    # ----- About -----
+    def _build_about(self, nb):
+        import webbrowser
+        tab = ttk.Frame(nb, padding=(0, 18, 0, 0))
+        nb.add(tab, text="About")
+        card = RoundFrame(tab)
+        card.pack(fill="x")
+        b = card.body
+        ttk.Label(b, text=APP_TITLE, style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(b, text=f"Version {VERSION}", style="CardSub.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 10))
+        link = tk.Label(b, text=GITHUB_URL, bg=PANEL, fg=ACCENT_HI, cursor="hand2", font=(UI_FONT, 10, "underline"))
+        link.grid(row=2, column=0, sticky="w")
+        link.bind("<Button-1>", lambda e: webbrowser.open(GITHUB_URL))
+        ttk.Label(b, text="Click the link to open the project on GitHub (releases, source and issues).",
+                  style="CardSub.TLabel").grid(row=3, column=0, sticky="w", pady=(10, 0))
+
+    # ----- TMDB -----
+    def _build_tmdb(self, nb):
+        tab = ttk.Frame(nb, padding=(0, 18, 0, 0))
+        nb.add(tab, text="TMDB")
+        self.tmdb_var = tk.StringVar(master=self.win, value=str(self.settings.get("tmdb_api_key") or ""))
+        self.tmdb_initial = self.tmdb_var.get().strip()
+        card = RoundFrame(tab)
+        card.pack(fill="x")
+        b = card.body
+        ttk.Label(b, text="TMDB API key", style="CardSub.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 16), pady=5)
+        self.tmdb_entry = ttk.Entry(b, textvariable=self.tmdb_var, show="•", width=44)
+        self.tmdb_entry.grid(row=0, column=1, sticky="ew", pady=5)
+        b.columnconfigure(1, weight=1)
+        self.show_tmdb = tk.BooleanVar(master=self.win, value=False)
+        ttk.Checkbutton(b, text="Show key", variable=self.show_tmdb, style="Card.TCheckbutton",
+                        command=lambda: self.tmdb_entry.configure(show="" if self.show_tmdb.get() else "•")
+                        ).grid(row=1, column=1, sticky="w", pady=(2, 0))
+        test = ttk.Frame(b, style="Inner.TFrame")
+        test.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        ttk.Button(test, text="Test key", command=self._test_tmdb).pack(side="left")
+        self.tmdb_result = ttk.Label(test, text="", style="CardSub.TLabel", wraplength=int(430 * self.app.k))
+        self.tmdb_result.pack(side="left", padx=14)
+        note = ("Used to name movies and TV episodes. Get a free key at themoviedb.org > Settings > API "
+                "(use the “API Key”, the 32-character one). Leave blank to turn lookups off.")
+        ttk.Label(tab, text=note, style="Muted.TLabel", wraplength=int(620 * self.app.k), justify="left"
+                  ).pack(anchor="w", pady=(12, 0))
+
+    def _test_tmdb(self):
+        key = self.tmdb_var.get().strip()
+        if not key:
+            self.tmdb_result.configure(text="Enter a key first.", foreground=BAD)
+            return
+        self.tmdb_result.configure(text="Testing…", foreground=MUTED)
+        box = []
+
+        def work():
+            try:
+                url = "https://api.themoviedb.org/3/configuration?" + urllib.parse.urlencode({"api_key": key})
+                with urllib.request.urlopen(url, timeout=8) as r:
+                    r.read()
+                box.append((True, "Key works."))
+            except urllib.error.HTTPError as e:
+                box.append((False, "TMDB rejected that key." if e.code in (401, 403) else f"TMDB error: HTTP {e.code}"))
+            except Exception as e:
+                box.append((False, f"Couldn't reach TMDB ({e})."))
+        threading.Thread(target=work, daemon=True).start()
+
+        def poll():
+            try:
+                if not box:
+                    self.win.after(200, poll)
+                    return
+                ok, msg = box[0]
+                self.tmdb_result.configure(text=msg, foreground=GOOD if ok else BAD)
+            except tk.TclError:
+                pass
+        self.win.after(200, poll)
 
     def _nas_dict(self):
         d = {k: v.get().strip() for k, v in self.nas_vars.items()}
@@ -2868,6 +2955,12 @@ class SettingsWindow:
                                      "“Upload finished rips to a NAS”.", parent=self.win)
                 return
             s["nas"] = nd
+        key = self.tmdb_var.get().strip()
+        if key != self.tmdb_initial:
+            if key:
+                s["tmdb_api_key"] = key
+            else:
+                s.pop("tmdb_api_key", None)
         prof = dict(s.get("profiles") or {})
         for st in (self.movie, self.tv):
             kind = st["kind"]
@@ -2898,7 +2991,7 @@ class SettingsWindow:
         except OSError as e:
             messagebox.showerror(APP_TITLE, f"Couldn't save the settings: {e}", parent=self.win)
             return
-        print("Settings saved. Profile changes apply from the next rip.")
+        print("Settings saved. Profile and TMDB changes apply from the next rip.")
         if nas_changed:
             reload_nas()
             cfg = nas_config()
@@ -3054,6 +3147,7 @@ class RipperGUI:
         title.pack(anchor="w")
         tk.Label(title, text="\u25cf", bg=BG, fg=ACCENT, font=(UI_FONT, 14)).pack(side="left", padx=(0, 8))
         ttk.Label(title, text=APP_TITLE, style="H1.TLabel").pack(side="left")
+        ttk.Label(title, text=f"v{VERSION}", style="Muted.TLabel").pack(side="left", padx=(8, 0), pady=(8, 0))
         self.subtitle = ttk.Label(left, text="Starting\u2026", style="Muted.TLabel")
         self.subtitle.pack(anchor="w", pady=(2, 0))
         self.stop_btn = ttk.Button(head, text="Stop all rips", style="Danger.TButton", command=self.stop_all,
@@ -3450,6 +3544,10 @@ def _attach_console():
 
 
 def main():
+    if "--version" in sys.argv:
+        _attach_console()
+        print(f"{APP_TITLE} {VERSION}")
+        return
     if "--tail" in sys.argv:
         i = sys.argv.index("--tail")
         tail_log(sys.argv[i + 1], sys.argv[i + 2] if len(sys.argv) > i + 2 else "Rip log")
