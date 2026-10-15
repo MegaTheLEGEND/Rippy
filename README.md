@@ -15,8 +15,10 @@ and removed from the local disk.
   numbered, and ripped one after another as `Show - S01E03`.
 
 
-<img width="940" height="832" alt="rippy" src="https://github.com/user-attachments/assets/5b7d87dc-0b79-430b-975f-d6ad4dc72682" />
+
+<img width="940" height="832" alt="rippy" src="https://github.com/user-attachments/assets/d6ca23b2-32a3-4471-a7a7-65dc905c3106" />
 <img width="779" height="789" alt="rippy settings" src="https://github.com/user-attachments/assets/38fa1b3e-c6b7-4b13-877c-ec00c7873a4a" />
+
 
 ## Where things go
 
