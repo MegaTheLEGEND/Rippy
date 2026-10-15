@@ -15,7 +15,7 @@
 
     <Icon Id="rippy.ico" SourceFile="$(IconPath)" />
     <Property Id="ARPPRODUCTICON" Value="rippy.ico" />
-    <Property Id="ARPURLINFOABOUT" Value="https://github.com/MegaTheLEGEND/Auto-DVD-Ripper" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/MegaTheLEGEND/Rippy" />
 
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="LocalProgramsDir" Name="Programs">

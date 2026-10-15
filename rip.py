@@ -43,8 +43,8 @@ except Exception:                       # no tkinter installed -> console mode o
 
 OS = platform.system()
 APP_TITLE = "Rippy"
-VERSION = "0.1.0"                           # bump this for each release
-GITHUB_URL = "https://github.com/MegaTheLEGEND/Auto-DVD-Ripper"
+VERSION = "0.1.1"                           # bump this for each release
+GITHUB_URL = "https://github.com/MegaTheLEGEND/Rippy"
 NOWIN = {"creationflags": 0x08000000} if OS == "Windows" else {}   # CREATE_NO_WINDOW: no console flashes from child tools
 HERE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 BUNDLE = Path(getattr(sys, "_MEIPASS", HERE))  # where PyInstaller unpacks embedded files
@@ -3049,9 +3049,54 @@ class SettingsWindow:
         link.bind("<Button-1>", lambda e: webbrowser.open(GITHUB_URL))
         ttk.Label(b, text="Click the link to open the project on GitHub (releases, source and issues).",
                   style="CardSub.TLabel").grid(row=3, column=0, sticky="w", pady=(10, 0))
+        chk = ttk.Frame(b, style="Inner.TFrame")
+        chk.grid(row=4, column=0, sticky="ew", pady=(16, 0))
+        self.upd_btn = ttk.Button(chk, text="Check for updates", command=self._check_updates)
+        self.upd_btn.pack(side="left")
+        self.upd_result = ttk.Label(chk, text="", style="CardSub.TLabel", wraplength=int(430 * self.app.k))
+        self.upd_result.pack(side="left", padx=14)
         if is_installed():
             ttk.Button(b, text="Uninstall Rippy\u2026", style="Danger.TButton", command=self._uninstall
-                       ).grid(row=4, column=0, sticky="w", pady=(16, 0))
+                       ).grid(row=5, column=0, sticky="w", pady=(16, 0))
+
+    def _check_updates(self):
+        """About > Check for updates: ask GitHub now, say the result here, and hand a newer release to the main
+        window (its banner, and the automatic download when that is on)."""
+        self.upd_btn.configure(state="disabled")
+        self.upd_result.configure(text="Checking\u2026", foreground=MUTED)
+        q = queue.Queue()
+
+        def work():
+            try:
+                q.put(("ok", check_for_update()))
+            except urllib.error.HTTPError as e:
+                q.put(("none", None) if e.code == 404 else ("err", f"GitHub answered {e.code} {e.reason}"))
+            except Exception as e:
+                q.put(("err", str(getattr(e, "reason", None) or e)))
+        threading.Thread(target=work, daemon=True).start()
+
+        def poll():
+            if not self.win.winfo_exists():
+                return
+            try:
+                kind, val = q.get_nowait()
+            except queue.Empty:
+                self.win.after(150, poll)
+                return
+            self.upd_btn.configure(state="normal")
+            if kind == "err":
+                self.upd_result.configure(text=f"Couldn't check: {val}", foreground=BAD)
+            elif val is None:
+                note = " (no releases are published yet)" if kind == "none" else ""
+                self.upd_result.configure(text=f"You're up to date: Rippy {VERSION}.{note}", foreground=GOOD)
+            else:
+                how = ("It is being downloaded and installs when Rippy is idle."
+                       if is_installed() and val.get("msi_url") and auto_update_enabled()
+                       else "See the banner at the top of the main window.")
+                self.upd_result.configure(text=f"Rippy {val['version']} is available (you have {VERSION}). {how}",
+                                          foreground=ACCENT_HI)
+                self.app.updateq.put(("manual", val))
+        self.win.after(0, poll)
 
     def _uninstall(self):
         n = len(self.app.active)
@@ -3691,6 +3736,9 @@ class RipperGUI:
         def work():
             try:
                 self.updateq.put(("found", check_for_update()))
+            except urllib.error.HTTPError as e:
+                # 404 = the repo has no release yet: nothing newer, so wait the normal interval
+                self.updateq.put(("found", None) if e.code == 404 else ("offline", None))
             except Exception:
                 self.updateq.put(("offline", None))   # offline / rate-limited / network not up yet after boot
         threading.Thread(target=work, daemon=True).start()
@@ -3698,8 +3746,11 @@ class RipperGUI:
     def _on_update_event(self, kind, value):
         if kind == "offline":
             self.root.after(5 * 60 * 1000, self._update_tick)       # try again soon rather than in 6 hours
-        elif kind == "found":
-            self.root.after(UPDATE_INTERVAL * 1000, self._update_tick)
+        elif kind in ("found", "manual"):            # "manual" = the About page's button (the timer is already running)
+            if kind == "found":
+                self.root.after(UPDATE_INTERVAL * 1000, self._update_tick)
+            else:
+                self._dismissed = None                # asked for it, so show it even if the banner was closed before
             info = value
             if not info or info["version"] == self._dismissed:
                 return
