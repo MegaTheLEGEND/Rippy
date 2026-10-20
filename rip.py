@@ -21,18 +21,24 @@ staging folder first; each finished file is uploaded, verified, then deleted loc
 If the NAS is unreachable the file stays local and is retried on the next start.
 Requires:  pip install smbprotocol
 
+Or upload to a Jellyfin server instead (Settings > Upload): Rippy signs in with a Jellyfin user and sends each file
+to the "Rippy Upload" plugin (https://github.com/MegaTheLEGEND/Rippy-Upload-Jellyfin-plugin) over HTTP(S). Only one
+destination is active at a time (NAS, Jellyfin, or none). Needs no extra packages.
+
 Usage:
     python rip.py            run the ripper (window; minimizes to the taskbar)
     python rip.py --nogui    run it in a plain console instead
     python rip.py --minimized   start hidden in the system tray, or minimized if there is no tray (what start-with-Windows uses)
     python rip.py --list     show detected drives/discs and exit (for testing)
     python rip.py --version   print the version, then exit
-    python rip.py --nas-test check the NAS login and write access, then exit
+    python rip.py --nas-test check the upload login (NAS or Jellyfin) and write access, then exit
+    python rip.py --upload-test FILE.mp4   send one file to the Jellyfin server's _Rippy Test folder, then exit
     python rip.py --check-update   check GitHub for a newer release, then exit
     rip.exe --export-portable NEW.exe   save a copy of the exe with your settings built in
 """
-import codecs, hashlib, json, os, platform, queue, re, shutil, statistics, subprocess, sys, tempfile, threading, time, traceback
-import urllib.error, urllib.parse, urllib.request
+import codecs, hashlib, json, os, platform, queue, re, shutil, socket, statistics, subprocess, sys, tempfile, threading, time, \
+    traceback, unicodedata, uuid
+import http.client, urllib.error, urllib.parse, urllib.request
 from pathlib import Path
 
 try:
@@ -49,7 +55,7 @@ except Exception:                       # not installed -> no tray; the X button
 
 OS = platform.system()
 APP_TITLE = "Rippy"
-VERSION = "0.1.4"                           # bump this for each release
+VERSION = "0.2.0"                           # bump this for each release
 GITHUB_URL = "https://github.com/MegaTheLEGEND/Rippy"
 NOWIN = {"creationflags": 0x08000000} if OS == "Windows" else {}   # CREATE_NO_WINDOW: no console flashes from child tools
 HERE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -1169,13 +1175,27 @@ _upload_lock = threading.Lock()
 upload_state = {}      # live info for the window: file, index, total, done, size, started (or just error)
 
 
+def upload_mode():
+    """Where finished rips go: "smb" (the NAS), "jellyfin" (the Rippy Upload plugin) or "off" (stay on this PC).
+    With no choice saved in Settings it is "smb", so an existing nas.json keeps working exactly as before."""
+    mode = load_settings().get("upload_mode")
+    return mode if mode in ("smb", "jellyfin", "off") else "smb"
+
+
+def upload_on():
+    """True if finished rips are uploaded anywhere (NAS or Jellyfin)."""
+    return bool(nas_config() or jf_config())
+
+
 def nas_config():
     """Load nas.json ({host, share, folder, username, password}). None = NAS upload off."""
     global _nas_cfg_cache
     if _nas_cfg_cache is None:
         cfg = False
         saved = load_settings().get("nas")
-        if isinstance(saved, dict):                  # set in the Settings window: wins over nas.json
+        if upload_mode() != "smb":                   # no upload, or the Jellyfin server is used instead
+            pass
+        elif isinstance(saved, dict):                # set in the Settings window: wins over nas.json
             if saved.get("enabled", True) and saved.get("host") and saved.get("share"):
                 cfg = saved                          # (switched off or incomplete there = NAS upload off)
         elif NAS_CONFIG_FILE.exists():
@@ -1207,7 +1227,9 @@ def _nas_path(cfg, rel=None):
 
 
 def nas_has(rel):
-    """True if this file is already on the NAS (False if no NAS or it can't be reached)."""
+    """True if this file is already on the NAS / Jellyfin server (False if neither or it can't be reached)."""
+    if jf_config():
+        return jf_has(rel)
     if not nas_config():
         return False
     try:
@@ -1226,6 +1248,12 @@ def folder_stems(rel_dir):
     if local.is_dir():
         stems |= {f.stem for f in local.rglob("*")      # includes the "Season N" subfolders
                   if f.is_file() and f.suffix.lower() in (".mp4", ".mkv") and ".partial" not in f.name}
+    if jf_config():
+        try:
+            return stems | jf_stems(rel_dir), True
+        except Exception as e:
+            print(f"Couldn't read the Jellyfin folder '{rel_dir}' ({e}); going by local files only.")
+            return stems, False
     if not nas_config():
         return stems, True
     try:
@@ -1303,8 +1331,8 @@ def nas_upload(local, rel, attempt=1):
 
 
 def upload_pending():
-    """Upload every finished rip in OUTPUT_DIR to the NAS, deleting each local copy after."""
-    if not nas_config() or not OUTPUT_DIR.exists():
+    """Upload every finished rip in OUTPUT_DIR to the NAS or Jellyfin server, deleting each local copy after."""
+    if not upload_on() or not OUTPUT_DIR.exists():
         return
     _upload_lock.acquire()                            # one upload pass at a time; later calls wait their turn
     try:
@@ -1314,21 +1342,21 @@ def upload_pending():
         for n, f in enumerate(files, 1):
             rel = f.relative_to(OUTPUT_DIR)
             for attempt in range(1, UPLOAD_ATTEMPTS + 1):
-                upload_state.update(file=str(rel), index=n, total=len(files), done=0,
+                upload_state.update(file=str(rel), index=n, total=len(files), done=0, phase="Uploading",
                                     size=f.stat().st_size, started=time.time(), attempt=attempt)
                 try:
-                    if nas_upload(f, rel, attempt):
+                    if remote_upload(f, rel, attempt):
                         f.unlink()
-                        print(f"\nUploaded to NAS, local copy removed: {rel}")
+                        print(f"\nUploaded to {upload_label()}, local copy removed: {rel}")
                     break
                 except Exception as e:
-                    print(f"\nNAS upload of '{rel}' failed on attempt {attempt}/{UPLOAD_ATTEMPTS} ({e}).")
+                    print(f"\n{upload_label()} upload of '{rel}' failed on attempt {attempt}/{UPLOAD_ATTEMPTS} ({e}).")
                     if attempt == UPLOAD_ATTEMPTS:
                         print("Keeping it locally; will retry later.")
                         upload_state.clear()
                         upload_state["error"] = f"{rel}: {e}"
-                        notify(APP_TITLE, f"NAS upload failed for '{rel.name}'; it's kept locally and will be retried.")
-                        return               # NAS probably unreachable; don't hammer it
+                        notify(APP_TITLE, f"{upload_label()} upload failed for '{rel.name}'; it's kept locally and will be retried.")
+                        return               # server probably unreachable; don't hammer it
                     time.sleep(5)
         upload_state.clear()
     finally:
@@ -1340,9 +1368,11 @@ def upload_async():
 
 
 def reload_nas(reset_connections=True):
-    """Forget the cached NAS config (and the open connections) after the Settings window changed it."""
-    global _nas_cfg_cache
+    """Forget the cached upload config (and the open connections / Jellyfin login) after the Settings window changed it."""
+    global _nas_cfg_cache, _jf_cfg_cache
     _nas_cfg_cache = None
+    _jf_cfg_cache = None
+    _jf_token.clear()
     if reset_connections:
         try:
             import smbclient
@@ -1380,12 +1410,351 @@ def nas_check(cfg):
 
 
 def nas_test():
-    cfg = nas_config()
+    jf = jf_config()
+    cfg = jf or nas_config()
     if not cfg:
-        print(f"No usable NAS config at {NAS_CONFIG_FILE}")
+        print(f"Upload is off: no usable NAS config at {NAS_CONFIG_FILE} and no Jellyfin server set in Settings.")
         return
-    ok, msg = nas_check(cfg)
-    print(f"NAS {msg}" if ok else f"NAS test failed: {msg}")
+    ok, msg = jf_check(cfg) if jf else nas_check(cfg)
+    print(f"{upload_label()} {msg}" if ok else f"{upload_label()} test failed: {msg}")
+
+
+# ===== Jellyfin upload ("Rippy Upload" plugin: signed-in HTTP(S) upload, no mounting needed) =====
+# Plugin and its API: https://github.com/MegaTheLEGEND/Rippy-Upload-Jellyfin-plugin
+#   POST /Users/AuthenticateByName          sign in, get a session token
+#   POST /Rippy/Upload?filename=&folder=    raw file body, X-Content-SHA256 header (the server verifies it)
+#   GET  /Rippy/List?folder=&recursive=     what's already there (skip duplicates, continue TV numbering)
+#   GET  /Rippy/Status                      can this user upload, quota
+_jf_cfg_cache = None
+_jf_token = {}                 # {"key": (url, user, password), "token": ...}
+_jf_lock = threading.Lock()
+_sha_cache = {}                # the SHA-256 of the file last checksummed, so a retry doesn't read it all again
+
+
+def upload_label():
+    """Short name of where uploads go, for messages and the window."""
+    return "Jellyfin" if jf_config() else "NAS"
+
+
+def _is_ip(host):
+    import ipaddress
+    try:
+        ipaddress.ip_address((host or "").strip("[]"))
+        return True
+    except ValueError:
+        return False
+
+
+def _jf_base_url(url):
+    """Tidy the typed server address. With no scheme: http:// for a bare IP address, https:// for anything else."""
+    url = (url or "").strip().rstrip("/")
+    if url.lower() in ("http:", "https:"):         # just a scheme typed, no address
+        return ""
+    if url and "://" not in url:
+        url = ("http://" if _is_ip(urllib.parse.urlsplit("//" + url).hostname) else "https://") + url
+    return url
+
+
+def jf_url_problem(url):
+    """None if Rippy may use this address. Plain http:// is only allowed for an IP address (a home network);
+    a hostname must be https://, so nobody sends their password unencrypted by accident."""
+    u = urllib.parse.urlsplit(url or "")
+    if u.scheme == "https" and u.hostname:
+        return None
+    if u.scheme == "http" and _is_ip(u.hostname):
+        return None
+    if u.scheme == "http":
+        return ("Plain http:// is only allowed for an IP address (like http://192.168.1.20:8096). "
+                "For a hostname use https:// so the password isn't sent unencrypted.")
+    return "Enter the server address as https://your.server or http://<IP address>:<port>."
+
+
+def jf_config():
+    """The Jellyfin server login from Settings ({url, username, password}). None = Jellyfin upload off."""
+    global _jf_cfg_cache
+    if _jf_cfg_cache is None:
+        cfg = False
+        if upload_mode() == "jellyfin":
+            saved = load_settings().get("jellyfin")
+            if isinstance(saved, dict) and saved.get("url") and saved.get("username"):
+                cfg = dict(saved)
+                cfg["url"] = _jf_base_url(cfg["url"])
+        _jf_cfg_cache = cfg
+    return _jf_cfg_cache or None
+
+
+def _jf_auth_header(token=None):
+    dev = hashlib.sha256(f"rippy|{platform.node()}|{uuid.getnode()}".encode("utf-8")).hexdigest()[:32]
+    h = f'MediaBrowser Client="{APP_TITLE}", Device="{APP_TITLE}", DeviceId="{dev}", Version="{VERSION}"'
+    return h + (f', Token="{token}"' if token else "")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+_jf_opener = urllib.request.build_opener(_NoRedirect)
+_JF_UA = f"Rippy/{VERSION}"
+
+
+def _jf_http(cfg, method, path, token=None, body=None, timeout=30, _upgraded=False):
+    """One small JSON request. Returns (HTTP status, parsed JSON or None). Network problems raise."""
+    if jf_url_problem(cfg["url"]):
+        raise RuntimeError(jf_url_problem(cfg["url"]))
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    headers = {"Authorization": _jf_auth_header(token), "Accept": "application/json", "User-Agent": _JF_UA}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(cfg["url"] + path, data=data, headers=headers, method=method)
+    try:
+        with _jf_opener.open(req, timeout=timeout) as r:
+            status, raw = r.status, r.read()
+    except urllib.error.HTTPError as e:
+        status, raw = e.code, e.read()
+        if status in (301, 302, 303, 307, 308):
+            loc, route = e.headers.get("Location") or "", path.split("?")[0]
+            if not _upgraded and cfg["url"].startswith("http://") and loc.startswith("https://") and route in loc:
+                cfg["url"] = loc.split(route)[0].rstrip("/")     # typed without https://: the server wants https
+                return _jf_http(cfg, method, path, token, body, timeout, _upgraded=True)
+            raise RuntimeError(f"the server redirects to {e.headers.get('Location')}: enter that address instead "
+                               "(for example the https:// one)")
+    try:
+        return status, (json.loads(raw.decode("utf-8")) if raw else None)
+    except ValueError:
+        return status, {"raw": raw.decode("utf-8", "replace").strip()[:200]}     # not JSON (a proxy's page, a stack trace)
+
+
+def _jf_login(cfg, force=False):
+    """Session token for this user (cached; a new login when `force` or the settings changed)."""
+    key = (cfg["url"], cfg["username"], cfg.get("password") or "")
+    with _jf_lock:
+        if force or _jf_token.get("key") != key:
+            _jf_token.clear()
+            status, data = _jf_http(cfg, "POST", "/Users/AuthenticateByName",
+                                    body={"Username": cfg["username"], "Pw": cfg.get("password") or ""})
+            if status == 401:
+                raise RuntimeError("Jellyfin refused the username or password")
+            if status != 200 or not isinstance(data, dict) or not data.get("AccessToken"):
+                raise RuntimeError(f"Jellyfin login failed ({_jf_err(status, data)})")
+            _jf_token.update(key=key, token=data["AccessToken"])
+        return _jf_token["token"]
+
+
+def _jf_call(cfg, method, path, **kw):
+    """Signed-in request; if the token was rejected (expired, or the user signed out) log in again once."""
+    for attempt in (1, 2):
+        status, data = _jf_http(cfg, method, path, token=_jf_login(cfg, force=attempt == 2), **kw)
+        if status != 401:
+            break
+    return status, data
+
+
+def _jf_err(status, data):
+    if isinstance(data, dict) and (data.get("message") or data.get("raw")):
+        return f"HTTP {status}: {data.get('message') or data['raw']}"
+    return {401: "HTTP 401: not signed in, or the Rippy Upload plugin isn't installed",
+            404: "HTTP 404: the Rippy Upload plugin isn't installed on this server"}.get(status, f"HTTP {status}")
+
+
+def _jf_clean(part, reserve=0):
+    """Make one file/folder name acceptable to the plugin (it refuses reserved characters, leading/trailing dots
+    and spaces, a leading dash, control characters, and names over 200 bytes). Names Rippy makes are almost always
+    fine already; this only trims the odd one (e.g. a show name ending in a dot)."""
+    s = unicodedata.normalize("NFC", part)
+    s = "".join(c for c in s if c not in '\\/:<>"|?*' and unicodedata.category(c)[0] != "C")
+    s = s.strip(" .").lstrip("-. ")
+    while len(s.encode("utf-8")) > 200 - reserve:
+        s = s[:-1]
+    return s.rstrip(" .") or "_"
+
+
+def _jf_folder(rel_dir):
+    return "/".join(_jf_clean(p) for p in Path(rel_dir).parts)
+
+
+def _jf_split(rel):
+    """(folder, filename) the plugin gets for a path relative to OUTPUT_DIR."""
+    p = Path(rel)
+    ext = p.suffix
+    return _jf_folder(p.parent), _jf_clean(p.stem, len(ext.encode("utf-8"))) + ext
+
+
+def jf_list(cfg, folder, recursive=False):
+    params = {"recursive": str(recursive).lower()}
+    if folder:
+        params["folder"] = folder
+    status, data = _jf_call(cfg, "GET", "/Rippy/List?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote))
+    if status != 200 or not isinstance(data, dict):
+        raise RuntimeError(_jf_err(status, data))
+    return data
+
+
+def jf_has(rel, cfg=None):
+    """True if the server already has this file (False if not, or if it can't be asked)."""
+    try:
+        folder, name = _jf_split(rel)
+        return name in {Path(f["path"]).name for f in jf_list(cfg or jf_config(), folder).get("files", [])}
+    except Exception:
+        return False
+
+
+def jf_stems(rel_dir):
+    """Names (without extension) of the rips already on the server under rel_dir, including subfolders."""
+    data = jf_list(jf_config(), _jf_folder(rel_dir), recursive=True)
+    return {Path(f["path"]).stem for f in data.get("files", [])}
+
+
+def _file_sha256(path, state=None):
+    state = upload_state if state is None else state
+    st = path.stat()
+    key = (str(path), st.st_size, st.st_mtime_ns)
+    if _sha_cache.get("key") != key:
+        h, done = hashlib.sha256(), 0
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(4 << 20)
+                if not chunk:
+                    break
+                h.update(chunk)
+                done += len(chunk)
+                state["done"], state["last"] = done, time.time()
+        _sha_cache.update(key=key, hex=h.hexdigest())
+    return _sha_cache["hex"]
+
+
+def _jf_send_file(cfg, token, local, name, folder, digest, ctype, size, state=None):
+    state = upload_state if state is None else state
+    """Stream the file as the raw request body. Returns (HTTP status, parsed JSON or None)."""
+    if jf_url_problem(cfg["url"]):
+        raise RuntimeError(jf_url_problem(cfg["url"]))
+    u = urllib.parse.urlsplit(cfg["url"])
+    Conn = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+    params = {"filename": name}
+    if folder:
+        params["folder"] = folder
+    path = u.path.rstrip("/") + "/Rippy/Upload?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+    conn = Conn(u.netloc, timeout=UPLOAD_STALL_SECONDS)       # a send that makes no progress this long raises
+    try:
+        conn.putrequest("POST", path)
+        for k, v in (("Authorization", _jf_auth_header(token)), ("Content-Type", ctype), ("Content-Length", str(size)),
+                     ("X-Content-SHA256", digest), ("Accept", "application/json"), ("User-Agent", _JF_UA)):
+            conn.putheader(k, v)
+        conn.endheaders()
+        early, done = None, 0
+        try:
+            with open(local, "rb") as f:
+                while True:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        break
+                    conn.send(chunk)
+                    done += len(chunk)
+                    state["done"], state["last"] = done, time.time()
+        except (socket.timeout, TimeoutError):
+            raise TimeoutError(f"the server accepted no data for {UPLOAD_STALL_SECONDS}s "
+                               f"(stopped at {done // 1000000} MB)")
+        except OSError as e:
+            early = e                    # the server may have answered early (not allowed, exists, too big) and hung up
+        try:
+            if conn.sock is not None:
+                conn.sock.settimeout(600)          # after the last byte the server finishes checking and filing it
+            resp = conn.getresponse()
+            raw = resp.read()
+        except Exception:
+            if early:
+                raise early
+            raise
+        try:
+            return resp.status, (json.loads(raw.decode("utf-8")) if raw else None)
+        except ValueError:
+            return resp.status, None
+    finally:
+        conn.close()
+
+
+def jf_upload(local, rel, attempt=1, cfg=None, state=None):
+    """Send one file to the Jellyfin server. True if it was accepted (the server checks the SHA-256 itself).
+    `cfg` / `state` are only given by the settings window's test upload (its own login and progress)."""
+    cfg = cfg or jf_config()
+    state = upload_state if state is None else state
+    folder, name = _jf_split(rel)
+    if jf_has(rel, cfg):
+        print(f"Jellyfin already has {rel}; keeping the local copy.")
+        return False
+    size = local.stat().st_size
+    state.update(phase="Checking", done=0, size=size, last=time.time())
+    digest = _file_sha256(local, state)            # the plugin requires it up front
+    state.update(phase="Uploading", done=0, last=time.time())
+    ctype = "video/mp4" if name.lower().endswith(".mp4") else "video/x-matroska"
+    for tries in (1, 2):
+        token = _jf_login(cfg, force=tries == 2)
+        status, data = _jf_send_file(cfg, token, local, name, folder, digest, ctype, size, state)
+        if status != 401:
+            break
+    if status == 201:
+        return True
+    if status == 409:
+        print(f"Jellyfin already has {rel}; keeping the local copy.")
+        return False
+    raise RuntimeError(_jf_err(status, data))
+
+
+def remote_upload(local, rel, attempt=1):
+    """Upload one file to wherever Settings says (NAS or Jellyfin). True = uploaded, so the local copy can go."""
+    return jf_upload(local, rel, attempt) if jf_config() else nas_upload(local, rel, attempt)
+
+
+def jf_test_upload(cfg, path, state):
+    """Upload one chosen .mp4/.mkv to <upload folder>/_Rippy Test on the server, exactly like a real rip would be
+    sent (login, checksum, streamed body). `state` fills with phase/done/size for a progress display.
+    Returns (ok, message). The plugin has no delete, so the test file stays on the server until an admin removes it."""
+    path = Path(path)
+    if path.suffix.lower() not in (".mp4", ".mkv"):
+        return False, "Failed: pick an .mp4 or .mkv file."
+    cfg = dict(cfg)
+    cfg["url"] = _jf_base_url(cfg.get("url"))
+    try:
+        sent = jf_upload(path, Path("_Rippy Test") / path.name, cfg=cfg, state=state)
+    except urllib.error.URLError as e:
+        return False, f"Failed: can't reach {cfg['url']} ({getattr(e, 'reason', e)})"
+    except Exception as e:
+        return False, f"Failed: {e}"
+    if not sent:
+        return True, ("The server already has a file with this name in _Rippy Test, so nothing new was sent "
+                      "(sign-in and the plugin work). Pick a different file, or rename it, to test again.")
+    return True, f"Uploaded {path.name} ({path.stat().st_size / 1e6:,.1f} MB) to _Rippy Test on the server and it passed the checksum."
+
+
+def jf_check(cfg):
+    """Sign in with `cfg` and ask the plugin whether this user may upload. Returns (ok, message)."""
+    cfg = dict(cfg)
+    cfg["url"] = _jf_base_url(cfg.get("url"))
+    try:
+        status, data = _jf_http(cfg, "POST", "/Users/AuthenticateByName", timeout=15,
+                                body={"Username": cfg.get("username") or "", "Pw": cfg.get("password") or ""})
+        if status == 401:
+            return False, f"Failed: the server refused that username or password. ({_jf_err(status, data)})"
+        if status != 200 or not isinstance(data, dict) or not data.get("AccessToken"):
+            return False, f"Failed at sign-in: {_jf_err(status, data)} (is that the Jellyfin address?)"
+        status, data = _jf_http(cfg, "GET", "/Rippy/Status", token=data["AccessToken"], timeout=15)
+    except urllib.error.URLError as e:
+        return False, f"Failed: can't reach {cfg['url']} ({getattr(e, 'reason', e)})"
+    except Exception as e:
+        return False, f"Failed: {e}"
+    if status == 404:
+        return False, "Signed in, but the Rippy Upload plugin isn't installed on this server."
+    if status != 200 or not isinstance(data, dict):
+        return False, f"Signed in, but the plugin's status check failed: {_jf_err(status, data)}"
+    if not data.get("configured"):
+        return False, "Signed in, but the plugin has no upload folder set (Jellyfin Dashboard > Plugins > Rippy Upload)."
+    if not data.get("canUpload"):
+        return False, ("Signed in, but this user isn't allowed to upload: an admin has to tick \u201cAllow video uploads\u201d "
+                       "for them on the plugin page.")
+    msg = f"OK: signed in as {cfg.get('username')} and allowed to upload."
+    if data.get("quotaBytes"):
+        msg += f" Using {data.get('usedBytes', 0) / 1e9:.1f} of {data['quotaBytes'] / 1e9:.1f} GB of the quota."
+    return True, msg
 
 
 # ===== Rip jobs (one HandBrakeCLI subprocess each) =====
@@ -2012,7 +2381,7 @@ def start_tv_job(hb, drive, info, scan, scan_thread, active):
         print(f"    title {ep['num']} ({ep['secs'] // 60} min) -> {ep['final'].name}"
               + ("   [already there; will skip]" if ep["there"] else ""))
     if not plan["listed"]:
-        print(f"[{drive}] (couldn't read the NAS folder, so only local files were checked)")
+        print(f"[{drive}] (couldn't read the {upload_label()} folder, so only local files were checked)")
     if all(ep["there"] for ep in plan["episodes"]):
         print(f"[{drive}] TV (beta): every episode on this disc is already in '{REVIEW_DIR_NAME}/{plan['show']}'; "
               "nothing to rip. Ejecting.")
@@ -2382,7 +2751,7 @@ class _QueueWriter:
 def _tag_for(line):
     if re.search(r"fail|error|couldn't|could not|not found|ended without", line, re.I):
         return "err"
-    if re.search(r"finished|uploaded to nas|nas ok", line, re.I):
+    if re.search(r"finished|uploaded to (nas|jellyfin)|(nas|jellyfin) ok", line, re.I):
         return "ok"
     return None
 
@@ -2902,7 +3271,7 @@ class ProfileForm:
 
 
 class SettingsWindow:
-    """NAS login, TMDB key and HandBrake profiles. Saved to Rippy's own settings.json; the nas.json and profile
+    """Upload destination (NAS or Jellyfin), TMDB key and HandBrake profiles. Saved to Rippy's own settings.json; the nas.json and profile
     files next to the app are only read (as the starting values), never written."""
 
     def __init__(self, app):
@@ -2984,10 +3353,10 @@ class SettingsWindow:
         b.columnconfigure(0, weight=1)
         self._build_about(tab)
 
-    # ----- NAS -----
+    # ----- Upload (NAS or Jellyfin) -----
     def _build_nas(self, nb):
         tab = ttk.Frame(nb, padding=(0, 18, 0, 0))
-        nb.add(tab, text="NAS upload")
+        nb.add(tab, text="Upload")
         saved = self.settings.get("nas")
         if isinstance(saved, dict):
             base = dict(saved)
@@ -2999,37 +3368,74 @@ class SettingsWindow:
             except Exception:
                 pass
             base["enabled"] = bool(base.get("host") and base.get("share"))
-        mk = lambda key: tk.StringVar(master=self.win, value=str(base.get(key) or ""))
-        self.nas_on = tk.BooleanVar(master=self.win, value=bool(base.get("enabled", True)))
-        self.nas_vars = {key: mk(key) for key in ("host", "share", "folder", "username", "password")}
-        self.nas_initial = self._nas_dict()
+        jf = self.settings.get("jellyfin")
+        jf = dict(jf) if isinstance(jf, dict) else {}
+        mode = self.settings.get("upload_mode")
+        if mode not in ("smb", "jellyfin", "off"):     # nothing chosen yet: whatever the NAS settings did until now
+            mode = "smb" if base.get("enabled", True) else "off"
+        self.up_mode = tk.StringVar(master=self.win, value=mode)
+        mk = lambda d, key: tk.StringVar(master=self.win, value=str(d.get(key) or ""))
+        self.nas_vars = {key: mk(base, key) for key in ("host", "share", "folder", "username", "password")}
+        self.jf_vars = {key: mk(jf, key) for key in ("url", "username", "password")}
+        self.upload_initial = (self.up_mode.get(), self._nas_dict(), self._jf_dict())
         card = RoundFrame(tab)
         card.pack(fill="x")
         b = card.body
-        ttk.Checkbutton(b, text="Upload finished rips to a NAS (SMB share)", variable=self.nas_on,
-                        style="Card.TCheckbutton").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
-        rows = (("Host or IP", "host", ""), ("Share", "share", ""), ("Folder inside the share", "folder", ""),
-                ("Username", "username", ""), ("Password", "password", "•"))
-        for i, (label, key, mask) in enumerate(rows, start=1):
-            ttk.Label(b, text=label, style="CardSub.TLabel").grid(row=i, column=0, sticky="w", padx=(0, 16), pady=5)
-            e = ttk.Entry(b, textvariable=self.nas_vars[key], show=mask, width=38)
-            e.grid(row=i, column=1, sticky="ew", pady=5)
-            if key == "password":
-                self.pw_entry = e
-        b.columnconfigure(1, weight=1)
-        self.show_pw = tk.BooleanVar(master=self.win, value=False)
-        ttk.Checkbutton(b, text="Show password", variable=self.show_pw, style="Card.TCheckbutton",
-                        command=lambda: self.pw_entry.configure(show="" if self.show_pw.get() else "•")
-                        ).grid(row=len(rows) + 1, column=1, sticky="w", pady=(2, 0))
-        test = ttk.Frame(b, style="Inner.TFrame")
-        test.grid(row=len(rows) + 2, column=0, columnspan=2, sticky="ew", pady=(12, 0))
-        ttk.Button(test, text="Test connection", command=self._test_nas).pack(side="left")
-        self.nas_result = ttk.Label(test, text="", style="CardSub.TLabel", wraplength=int(430 * self.app.k))
-        self.nas_result.pack(side="left", padx=14)
-        note = ("Example: host 192.168.1.101, share “Received Video”. Leave the folder empty to use the share's top level. "
-                "Your nas.json is never changed.")
+        ttk.Label(b, text="Where should finished rips go?", style="CardTitle.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 6))
+        for i, (val, text) in enumerate((("off", "Keep them on this PC (no upload)"),
+                                         ("smb", "Upload to a NAS (SMB share)"),
+                                         ("jellyfin", "Upload to a Jellyfin server (Rippy Upload plugin)")), start=1):
+            ttk.Radiobutton(b, text=text, value=val, variable=self.up_mode, style="Card.TRadiobutton",
+                            command=self._sync_upload).grid(row=i, column=0, sticky="w", pady=2)
+        b.columnconfigure(0, weight=1)
+        self.smb_box, self.nas_result = self._field_box(
+            b, (("Host or IP", "host", ""), ("Share", "share", ""), ("Folder inside the share", "folder", ""),
+                ("Username", "username", ""), ("Password", "password", "•")), self.nas_vars)
+        self.jf_box, self.jf_result = self._field_box(
+            b, (("Server address", "url", ""), ("Username", "username", ""), ("Password", "password", "•")),
+            self.jf_vars, upload_test=True)
+        self.smb_box.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        self.jf_box.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        self._sync_upload()
+        note = ("NAS: for example host 192.168.1.101, share \u201cReceived Video\u201d; leave the folder empty to use the share's "
+                "top level. Your nas.json is never changed.\n"
+                "Jellyfin: the server address, for example http://192.168.1.20:8096, and a Jellyfin user that an admin has "
+                "ticked on the Rippy Upload plugin's page. Only one destination is used at a time.")
         ttk.Label(tab, text=note, style="Muted.TLabel", wraplength=int(620 * self.app.k), justify="left"
                   ).pack(anchor="w", pady=(12, 0))
+
+    def _field_box(self, parent, rows, variables, upload_test=False):
+        """A block of labelled entries (+ show password + Test connection). Returns (frame, result label)."""
+        box = ttk.Frame(parent, style="Inner.TFrame")
+        pw = None
+        for i, (label, key, mask) in enumerate(rows):
+            ttk.Label(box, text=label, style="CardSub.TLabel").grid(row=i, column=0, sticky="w", padx=(0, 16), pady=5)
+            e = ttk.Entry(box, textvariable=variables[key], show=mask, width=38)
+            e.grid(row=i, column=1, sticky="ew", pady=5)
+            if key == "password":
+                pw = e
+        box.columnconfigure(1, weight=1)
+        show = tk.BooleanVar(master=self.win, value=False)
+        ttk.Checkbutton(box, text="Show password", variable=show, style="Card.TCheckbutton",
+                        command=lambda: pw.configure(show="" if show.get() else "•")
+                        ).grid(row=len(rows), column=1, sticky="w", pady=(2, 0))
+        test = ttk.Frame(box, style="Inner.TFrame")
+        test.grid(row=len(rows) + 1, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        ttk.Button(test, text="Test connection", command=self._test_upload).pack(side="left")
+        if upload_test:
+            ttk.Button(test, text="Test upload\u2026", command=self._test_upload_file).pack(side="left", padx=(8, 0))
+        result = ttk.Label(test, text="", style="CardSub.TLabel", wraplength=int(430 * self.app.k))
+        result.pack(side="left", padx=14)
+        return box, result
+
+    def _sync_upload(self):
+        mode = self.up_mode.get()
+        for key, box in (("smb", self.smb_box), ("jellyfin", self.jf_box)):
+            if key == mode:
+                box.grid()
+            else:
+                box.grid_remove()
 
     # ----- Portable copy -----
     def _build_portable(self, nb):
@@ -3039,7 +3445,7 @@ class SettingsWindow:
         card.pack(fill="x")
         b = card.body
         ttk.Label(b, text="Copy Rippy with your settings built in", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(b, text="Saves one exe that carries your NAS login, TMDB key and profiles inside it. Copy that exe to "
+        ttk.Label(b, text="Saves one exe that carries your NAS or Jellyfin login, TMDB key and profiles inside it. Copy that exe to "
                   "other PCs and run it: no setup, no extra files.", style="CardSub.TLabel",
                   wraplength=int(600 * self.app.k), justify="left").grid(row=1, column=0, sticky="w", pady=(4, 12))
         row = ttk.Frame(b, style="Inner.TFrame")
@@ -3051,7 +3457,7 @@ class SettingsWindow:
         if not getattr(sys, "frozen", False):
             self.export_btn.state(["disabled"])
             self.export_result.configure(text="Only available in the Rippy exe, not 'python rip.py'.")
-        note = ("It copies what is saved, so press Save here first if you just changed something. The copy holds the NAS "
+        note = ("It copies what is saved, so press Save here first if you just changed something. The copy holds the NAS / Jellyfin "
                 "password and TMDB key in readable form, so only hand it to people you'd give those to. On each PC, "
                 "settings saved there override the built-in ones. Updating Rippy (or running a newer exe) loses the "
                 "built-in settings unless you save a new copy.")
@@ -3213,17 +3619,32 @@ class SettingsWindow:
     def _nas_dict(self):
         d = {k: v.get().strip() for k, v in self.nas_vars.items()}
         d["password"] = self.nas_vars["password"].get()          # a password may legitimately start/end with a space
-        d["enabled"] = bool(self.nas_on.get())
+        d["enabled"] = self.up_mode.get() == "smb"
         return d
 
-    def _test_nas(self):
-        d = self._nas_dict()
-        if not (d["host"] and d["share"]):
-            self.nas_result.configure(text="Enter a host and a share first.", foreground=BAD)
-            return
-        self.nas_result.configure(text="Testing…", foreground=MUTED)
+    def _jf_dict(self):
+        d = {k: v.get().strip() for k, v in self.jf_vars.items()}
+        d["password"] = self.jf_vars["password"].get()
+        d["url"] = _jf_base_url(d["url"])
+        return d
+
+    def _test_upload(self):
+        if self.up_mode.get() == "jellyfin":
+            d, check, result = self._jf_dict(), jf_check, self.jf_result
+            if not (d["url"] and d["username"]):
+                result.configure(text="Enter the server address and a username first.", foreground=BAD)
+                return
+            if jf_url_problem(d["url"]):
+                result.configure(text=jf_url_problem(d["url"]), foreground=BAD)
+                return
+        else:
+            d, check, result = self._nas_dict(), nas_check, self.nas_result
+            if not (d["host"] and d["share"]):
+                result.configure(text="Enter a host and a share first.", foreground=BAD)
+                return
+        result.configure(text="Testing…", foreground=MUTED)
         box = []
-        threading.Thread(target=lambda: box.append(nas_check(d)), daemon=True).start()
+        threading.Thread(target=lambda: box.append(check(d)), daemon=True).start()
 
         def poll():
             try:
@@ -3231,10 +3652,43 @@ class SettingsWindow:
                     self.win.after(200, poll)
                     return
                 ok, msg = box[0]
-                self.nas_result.configure(text=msg, foreground=GOOD if ok else BAD)
+                result.configure(text=msg, foreground=GOOD if ok else BAD)
             except tk.TclError:                                    # window closed meanwhile
                 pass
         self.win.after(200, poll)
+
+    def _test_upload_file(self):
+        """Pick a small video and send it through the real upload path to the _Rippy Test folder."""
+        d, result = self._jf_dict(), self.jf_result
+        if not (d["url"] and d["username"]):
+            result.configure(text="Enter the server address and a username first.", foreground=BAD)
+            return
+        path = self.filedialog.askopenfilename(parent=self.win, title="Pick a small .mp4 or .mkv to test with",
+                                               filetypes=[("Video files", "*.mp4 *.mkv")])
+        if not path:
+            return
+        if not messagebox.askokcancel(APP_TITLE, "This uploads the file to the _Rippy Test folder inside the plugin's "
+                                      "upload folder. The plugin can't delete files, so an admin has to remove it "
+                                      "afterwards. Use a small file.", parent=self.win):
+            return
+        state, box = {}, []
+        threading.Thread(target=lambda: box.append(jf_test_upload(d, path, state)), daemon=True).start()
+        result.configure(text="Starting\u2026", foreground=MUTED)
+
+        def poll():
+            try:
+                if not box:
+                    size, done = max(state.get("size", 0), 1), state.get("done", 0)
+                    what = "Checking file" if state.get("phase") == "Checking" else "Uploading"
+                    result.configure(text=f"{what}\u2026 {done * 100 // size}%" if state else "Starting\u2026",
+                                     foreground=MUTED)
+                    self.win.after(300, poll)
+                    return
+                ok, msg = box[0]
+                result.configure(text=msg, foreground=GOOD if ok else BAD)
+            except tk.TclError:                                    # window closed meanwhile
+                pass
+        self.win.after(300, poll)
 
     # ----- profiles -----
     @staticmethod
@@ -3408,15 +3862,24 @@ class SettingsWindow:
     # ----- save -----
     def save(self):
         s = load_settings()                                         # re-read, so nothing saved elsewhere is lost
-        nd = self._nas_dict()
-        nas_changed = nd != self.nas_initial
+        mode, nd, jd = self.up_mode.get(), self._nas_dict(), self._jf_dict()
+        nas_changed = (mode, nd, jd) != self.upload_initial
         if nas_changed:
-            if nd["enabled"] and not (nd["host"] and nd["share"]):
+            if mode == "smb" and not (nd["host"] and nd["share"]):
                 self.nb.select(1)
-                messagebox.showerror(APP_TITLE, "Enter at least a host and a share, or untick "
-                                     "“Upload finished rips to a NAS”.", parent=self.win)
+                messagebox.showerror(APP_TITLE, "Enter at least a host and a share, or pick another upload "
+                                     "destination.", parent=self.win)
                 return
-            s["nas"] = nd
+            if mode == "jellyfin" and not (jd["url"] and jd["username"]):
+                self.nb.select(1)
+                messagebox.showerror(APP_TITLE, "Enter the Jellyfin server address and a username, or pick another "
+                                     "upload destination.", parent=self.win)
+                return
+            if mode == "jellyfin" and jf_url_problem(jd["url"]):
+                self.nb.select(1)
+                messagebox.showerror(APP_TITLE, jf_url_problem(jd["url"]), parent=self.win)
+                return
+            s["upload_mode"], s["nas"], s["jellyfin"] = mode, nd, jd
         key = self.tmdb_var.get().strip()
         if key != self.tmdb_initial:
             if key:
@@ -3473,12 +3936,15 @@ class SettingsWindow:
         print("Settings saved. Profile and TMDB changes apply from the next rip.")
         if nas_changed:
             reload_nas()
-            cfg = nas_config()
-            if cfg:
+            cfg, jf = nas_config(), jf_config()
+            if jf:
+                print(f"Jellyfin upload on: {jf['url']} (signed in as {jf['username']})")
+                upload_async()
+            elif cfg:
                 print(f"NAS upload on: \\\\{cfg['host']}\\{cfg['share']}\\{cfg.get('folder', '')}")
                 upload_async()
             else:
-                print("NAS upload is off.")
+                print("Upload is off: finished rips stay on this PC.")
         self.close()
 
 
@@ -4117,7 +4583,8 @@ class RipperGUI:
         if st.get("file"):
             size, done = max(st.get("size", 0), 1), st.get("done", 0)
             el = max(time.time() - st.get("started", time.time()), 0.001)
-            self.up_title.configure(text="Uploading to NAS" + (f"  ({st['index']} of {st['total']})" if st.get("total", 1) > 1 else ""))
+            head = "Checking file before upload" if st.get("phase") == "Checking" else f"Uploading to {upload_label()}"
+            self.up_title.configure(text=head + (f"  ({st['index']} of {st['total']})" if st.get("total", 1) > 1 else ""))
             self.up_file.configure(text=st["file"])
             self.up_bar.configure(style="Up.Horizontal.TProgressbar", value=done * 100 / size)
             self.up_info.configure(text=f"{done * 100 / size:.0f}%   \u00b7   {done / 1e6:,.0f} of {size / 1e6:,.0f} MB"
@@ -4130,7 +4597,7 @@ class RipperGUI:
             self.up_retry.pack_forget()
             self.up_bar.pack(fill="x", before=self.up_info)
         elif st.get("error"):
-            self.up_title.configure(text="NAS upload failed")
+            self.up_title.configure(text=f"{upload_label()} upload failed")
             self.up_file.configure(text="Files stay on this PC and are retried when the next rip finishes or on restart.")
             self.up_info.configure(text=st["error"])
             self.up_bar.pack_forget()
@@ -4151,8 +4618,11 @@ class RipperGUI:
 def startup(hb, gui=False):
     print(f"Using {hb}\nDrives: {list_drives() or 'none found yet'}\n"
           "Watching for discs..." + ("" if gui else " (Ctrl+C to quit)"))
-    cfg = nas_config()
-    if cfg:
+    cfg, jf = nas_config(), jf_config()
+    if jf:
+        print(f"Jellyfin upload on: {jf['url']} (signed in as {jf['username']})")
+        upload_async()                             # send anything left over from earlier runs
+    elif cfg:
         try:
             import smbclient  # noqa: F401
             print(f"NAS upload on: \\\\{cfg['host']}\\{cfg['share']}\\{cfg.get('folder', '')}")
@@ -4304,6 +4774,16 @@ def main():
     if "--nas-test" in sys.argv:
         _attach_console()
         nas_test()
+        return
+    if "--upload-test" in sys.argv:
+        _attach_console()
+        i = sys.argv.index("--upload-test")
+        if i + 1 >= len(sys.argv) or not jf_config():
+            print("Usage: rip.py --upload-test FILE.mp4   (needs the Jellyfin server set in Settings > Upload)")
+            return
+        st = {}
+        ok, msg = jf_test_upload(jf_config(), sys.argv[i + 1], st)
+        print(("OK: " if ok else "") + msg)
         return
     if "--list" in sys.argv:
         _attach_console()

@@ -53,7 +53,7 @@ That file can hold the NAS password, so on Mac/Linux it is made readable by you 
   **Log** button (live HandBrake/MakeMKV output) and a **Cancel** button. TV discs
   show "Episode 2 of 6" and overall progress. The window title, and so the taskbar
   tooltip, shows overall progress too.
-- **NAS upload** panel (appears while uploading): file, progress, speed. If an
+- **Upload** panel (appears while uploading to the NAS or Jellyfin): file, progress, speed. If an
   upload fails, the file stays local and a **Retry now** button appears.
 - **Activity**: a running log of everything that happens.
 - **Stop all rips** (or closing the window) stops everything, deletes unfinished
@@ -109,11 +109,16 @@ TV mode asks almost nothing. It reads the disc, looks the show up on TMDB, and:
 Because the numbering is a best guess, TV rips go to `_Needs Review/<Show>/Season N/`.
 The log for each disc lists every title and the file it became.
 
+## Upload destination
+
+**Settings > Upload** picks where finished rips go. Only one is active at a time:
+**keep them on this PC**, upload to a **NAS** (SMB, below), or upload to a **Jellyfin server** (further below).
+
 ## NAS upload (SMB)
 
 No drive mounting needed. Rippy talks SMB directly using `smbprotocol`.
 
-Set it up in **Settings > NAS upload** (host or IP, share, folder inside the share,
+Set it up in **Settings > Upload > NAS** (host or IP, share, folder inside the share,
 username, password, and a **Test connection** button that checks login and write
 access), or put a `nas.json` next to the script/exe (see `nas.json.example`):
 
@@ -132,6 +137,35 @@ How uploads behave:
 - Anything left over from an earlier run is uploaded when Rippy starts.
 
 You can also test from a console: `python rip.py --nas-test`.
+
+## Jellyfin upload (signed-in server)
+
+Instead of a NAS, Rippy can send files to a Jellyfin server that has the
+[Rippy Upload plugin](https://github.com/MegaTheLEGEND/Rippy-Upload-Jellyfin-plugin) installed. It uses plain
+HTTP(S) and needs no extra Python packages.
+
+Set it up in **Settings > Upload > Jellyfin server**: the server address (for example `http://192.168.1.20:8096`),
+and the username and password of a Jellyfin user that an admin has ticked under **Allow video uploads** on the
+plugin's page. **Test connection** signs in and asks the plugin whether that user may upload (it also reports
+a missing plugin, an unset upload folder, and quota use). Rippy insists on HTTPS: plain `http://` is only accepted for an IP address
+(for example `http://192.168.1.20:8096`); a hostname must be `https://`, and an address typed without a scheme becomes
+`https://` unless it is an IP. This keeps the password from being sent unencrypted by accident.
+
+How it behaves:
+- Rippy signs in with the username and password, then sends each finished file with its SHA-256; the server checks
+  it and only then files the upload, and Rippy deletes the local copy.
+- The same folder layout is used: movies at the top, unsure ones and TV episodes under `_Needs Review/...`. Rippy
+  asks the plugin what is already there to skip duplicates and continue TV episode numbering. Files an admin has
+  already moved out of the plugin's upload folder are no longer listed, so a re-inserted disc can be ripped again.
+- If the server already has a file of that name, the local copy is kept. If the server is unreachable, the user is
+  refused, or the quota is full, the file stays local and is retried (`UPLOAD_ATTEMPTS`, then on the next rip or start).
+- The login is saved in Rippy's settings file next to the NAS one (and is included in a portable copy).
+
+`python rip.py --nas-test` tests whichever destination is active.
+
+**Test upload…** (next to Test connection) sends a video you pick through the real upload path into a
+`_Rippy Test` folder, with a progress readout; `python rip.py --upload-test FILE.mp4` does the same from a console.
+The plugin can't delete files, so remove the test file on the server afterwards.
 
 ## Settings window
 
