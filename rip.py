@@ -55,7 +55,7 @@ except Exception:                       # not installed -> no tray; the X button
 
 OS = platform.system()
 APP_TITLE = "Rippy"
-VERSION = "0.2.0"                           # bump this for each release
+VERSION = "0.2.1"                           # bump this for each release
 GITHUB_URL = "https://github.com/MegaTheLEGEND/Rippy"
 NOWIN = {"creationflags": 0x08000000} if OS == "Windows" else {}   # CREATE_NO_WINDOW: no console flashes from child tools
 HERE = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -82,6 +82,7 @@ SCAN_PREVIEWS = 5                           # preview images HandBrake decodes p
 SCAN_TIMEOUT = 900                          # seconds to allow for the one-time disc scan
 UPLOAD_STALL_SECONDS = 60                   # NAS upload: no data accepted for this long = stalled; reconnect and retry
 UPLOAD_ATTEMPTS = 3                         # tries per file before giving up until the next rip/restart
+UPLOAD_CHUNK_BYTES = 32 * 1024 * 1024        # Jellyfin upload: size of each request (proxies like Cloudflare cap one request at 100 MB)
 UPDATE_CHECK = True                         # look for a newer release on GitHub (at start, then every UPDATE_INTERVAL seconds)
 UPDATE_INTERVAL = 6 * 3600
 NAS_CONFIG_FILE = HERE / "nas.json"         # NAS login: next to the exe/script, else the copy embedded in the exe
@@ -1423,6 +1424,7 @@ def nas_test():
 # Plugin and its API: https://github.com/MegaTheLEGEND/Rippy-Upload-Jellyfin-plugin
 #   POST /Users/AuthenticateByName          sign in, get a session token
 #   POST /Rippy/Upload?filename=&folder=    raw file body, X-Content-SHA256 header (the server verifies it)
+#   POST /Rippy/Upload/Chunk, /Complete     the same upload in ~32 MB pieces (plugin 1.0.2+; used automatically)
 #   GET  /Rippy/List?folder=&recursive=     what's already there (skip duplicates, continue TV numbering)
 #   GET  /Rippy/Status                      can this user upload, quota
 _jf_cfg_cache = None
@@ -1673,6 +1675,161 @@ def _jf_send_file(cfg, token, local, name, folder, digest, ctype, size, state=No
         conn.close()
 
 
+def _jf_post_bytes(cfg, token, route, params, data=b"", ctype="application/octet-stream", extra=None, state=None, base=0):
+    """One POST whose body is `data` (one chunk, or empty). Returns (HTTP status, parsed JSON or None).
+    Progress in `state` counts from `base`. Network problems raise."""
+    if jf_url_problem(cfg["url"]):
+        raise RuntimeError(jf_url_problem(cfg["url"]))
+    u = urllib.parse.urlsplit(cfg["url"])
+    Conn = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+    path = u.path.rstrip("/") + route + "?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+    conn = Conn(u.netloc, timeout=UPLOAD_STALL_SECONDS)
+    try:
+        conn.putrequest("POST", path)
+        heads = [("Authorization", _jf_auth_header(token)), ("Content-Type", ctype), ("Content-Length", str(len(data))),
+                 ("Accept", "application/json"), ("User-Agent", _JF_UA)] + list((extra or {}).items())
+        for k, v in heads:
+            conn.putheader(k, v)
+        conn.endheaders()
+        early = None
+        try:
+            view = memoryview(data)
+            for i in range(0, len(data), 1 << 20):
+                conn.send(view[i:i + (1 << 20)])
+                if state is not None:
+                    state["done"], state["last"] = base + min(i + (1 << 20), len(data)), time.time()
+        except (socket.timeout, TimeoutError):
+            raise TimeoutError(f"the server accepted no data for {UPLOAD_STALL_SECONDS}s")
+        except OSError as e:
+            early = e                    # the server may have answered early and hung up
+        try:
+            if conn.sock is not None:
+                conn.sock.settimeout(600)
+            resp = conn.getresponse()
+            raw = resp.read()
+        except Exception:
+            if early:
+                raise early
+            raise
+        try:
+            return resp.status, (json.loads(raw.decode("utf-8")) if raw else None)
+        except ValueError:
+            return resp.status, None
+    finally:
+        conn.close()
+
+
+def _jf_chunk_size(cfg):
+    """Chunk size in bytes if the plugin supports chunked uploads (a plugin from 1.0.2 on), else 0."""
+    status, data = _jf_call(cfg, "GET", "/Rippy/Status", timeout=15)
+    if status == 200 and isinstance(data, dict) and data.get("chunked"):
+        return max(1 << 20, min(UPLOAD_CHUNK_BYTES, int(data.get("maxChunkBytes") or UPLOAD_CHUNK_BYTES)))
+    return 0
+
+
+def _jf_progress(cfg, upload_id):
+    """How many bytes of this chunked upload the server already holds (0 = none)."""
+    status, data = _jf_call(cfg, "GET", "/Rippy/Upload/Progress?" + urllib.parse.urlencode({"uploadId": upload_id}))
+    if status == 200 and isinstance(data, dict):
+        return int(data.get("received") or 0)
+    raise RuntimeError(_jf_err(status, data))
+
+
+def _jf_remote_has(cfg, folder, name, size):
+    try:
+        return any(Path(f["path"]).name == name and f.get("size") == size
+                   for f in jf_list(cfg, folder).get("files", []))
+    except Exception:
+        return False
+
+
+_JF_TRANSIENT = (429, 500, 502, 503, 504, 520, 521, 522, 523, 524)
+_JF_NET_ERRORS = (OSError, TimeoutError, http.client.HTTPException)
+
+
+def _jf_upload_chunked(cfg, local, name, folder, digest, size, chunk, state):
+    """Send the file as consecutive ~32 MB requests (each small enough for Cloudflare and friends), then ask the
+    server to verify the SHA-256 and file it. Resumes from what the server already has after a hiccup.
+    True if accepted, False if the server already has that name."""
+    upload_id = digest[:32]                       # same file = same id, so a retry continues where it stopped
+    offset = _jf_progress(cfg, upload_id)
+    if offset > size:
+        offset = 0
+    failures = 0
+    with open(local, "rb") as f:
+        while offset < size:
+            f.seek(offset)
+            data = f.read(min(chunk, size - offset))
+            state.update(done=offset, last=time.time())
+            status = resp = None
+            try:
+                for tries in (1, 2):
+                    token = _jf_login(cfg, force=tries == 2)
+                    status, resp = _jf_post_bytes(cfg, token, "/Rippy/Upload/Chunk",
+                                                  {"uploadId": upload_id, "offset": offset, "total": size},
+                                                  data, state=state, base=offset)
+                    if status != 401:
+                        break
+            except _JF_NET_ERRORS as e:
+                failures += 1
+                if failures > 5:
+                    raise
+                print(f"\nJellyfin chunk at {offset // 1000000} MB failed ({e}); retrying ({failures}/5)...")
+                time.sleep(min(30, 3 * failures))
+                try:
+                    offset = _jf_progress(cfg, upload_id)
+                except _JF_NET_ERRORS:
+                    pass
+                continue
+            if status == 200 and isinstance(resp, dict):
+                offset = int(resp.get("received") or offset + len(data))
+                failures = 0
+            elif status == 409 and isinstance(resp, dict) and "received" in resp:
+                failures += 1                      # the server holds a different amount than we thought: continue from there
+                if failures > 5:
+                    raise RuntimeError("the server and Rippy can't agree where the upload stopped")
+                offset = int(resp["received"])
+                if offset > size:
+                    offset = 0
+            elif status in _JF_TRANSIENT:
+                failures += 1
+                if failures > 5:
+                    raise RuntimeError(_jf_err(status, resp))
+                print(f"\nJellyfin answered HTTP {status} for a chunk; retrying ({failures}/5)...")
+                time.sleep(min(30, 3 * failures))
+                try:
+                    offset = _jf_progress(cfg, upload_id)
+                except _JF_NET_ERRORS:
+                    pass
+            else:
+                raise RuntimeError(_jf_err(status, resp))
+    state.update(phase="Finishing", done=size, last=time.time())
+    params = {"uploadId": upload_id, "filename": name, "total": size}
+    if folder:
+        params["folder"] = folder
+    status = resp = None
+    for attempt in (1, 2, 3):
+        try:
+            token = _jf_login(cfg, force=status == 401)
+            status, resp = _jf_post_bytes(cfg, token, "/Rippy/Upload/Complete", params, b"",
+                                          extra={"X-Content-SHA256": digest}, state=state, base=size)
+        except _JF_NET_ERRORS:
+            status, resp = None, None
+        if status == 201:
+            return True
+        if status == 409 and isinstance(resp, dict) and resp.get("error") == "exists":
+            return False
+        if status == 401:
+            continue
+        if status is None or status == 404 or status in _JF_TRANSIENT:
+            if _jf_remote_has(cfg, folder, name, size):     # the answer may just have been lost on the way back
+                return True
+            time.sleep(3 * attempt)
+            continue
+        raise RuntimeError(_jf_err(status, resp))
+    raise RuntimeError("the server did not confirm the finished upload")
+
+
 def jf_upload(local, rel, attempt=1, cfg=None, state=None):
     """Send one file to the Jellyfin server. True if it was accepted (the server checks the SHA-256 itself).
     `cfg` / `state` are only given by the settings window's test upload (its own login and progress)."""
@@ -1686,6 +1843,12 @@ def jf_upload(local, rel, attempt=1, cfg=None, state=None):
     state.update(phase="Checking", done=0, size=size, last=time.time())
     digest = _file_sha256(local, state)            # the plugin requires it up front
     state.update(phase="Uploading", done=0, last=time.time())
+    try:
+        chunk = _jf_chunk_size(cfg)                # newer plugins take the file in pieces (works behind Cloudflare)
+    except Exception:
+        chunk = 0
+    if chunk:
+        return _jf_upload_chunked(cfg, local, name, folder, digest, size, chunk, state)
     ctype = "video/mp4" if name.lower().endswith(".mp4") else "video/x-matroska"
     for tries in (1, 2):
         token = _jf_login(cfg, force=tries == 2)
